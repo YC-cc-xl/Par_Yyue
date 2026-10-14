@@ -1,0 +1,67 @@
+{
+  "name": "par-yyue",
+  "version": "1.0.0",
+  "description": "自动合成 - 视频/配音/字幕/BGM 批量渲染桌面应用",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "author": "ParYyue",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build",
+    "build:backend": "node scripts/build-backend.mjs",
+    "dist": "node scripts/dist.mjs"
+  },
+  "dependencies": {
+    "element-plus": "^2.8.8",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "com.paryyue.autocompose",
+    "productName": "自动合成",
+    "copyright": "Copyright © 2026 ParYyue",
+    "directories": {
+      "output": "release"
+    },
+    "afterPack": "scripts/after-pack.cjs",
+    "electronDist": "node_modules/electron/dist",
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/pyinstaller/backend",
+        "to": "backend"
+      },
+      {
+        "from": "ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "ffmpeg.exe"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico"
+    }
+  }
+}

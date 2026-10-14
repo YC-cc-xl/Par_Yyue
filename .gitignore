@@ -1,0 +1,14 @@
+node_modules/
+dist/
+release/
+backend/__pycache__/
+backend/.venv/
+backend/data/
+# PyInstaller 打包后端产生的中间产物
+build/
+# ffmpeg 二进制（约 161MB，暂不纳入版本管理，需自行放置到程序目录 ffmpeg/ 下）
+ffmpeg/*.exe
+*.pyc
+*.db
+*.log
+.DS_Store
