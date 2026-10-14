@@ -52,5 +52,9 @@ export const api = {
 
   // 批量合成任务
   createTask: (payload) => request('/api/compose/tasks', { method: 'POST', body: payload }),
-  getTask: (id) => request(`/api/compose/tasks/${id}`)
+  getTask: (id) => request(`/api/compose/tasks/${id}`),
+  // 任务进度：全局进度（已完成组/总组）+ 各分集独立进度与状态，供前端轮询刷新
+  getTaskProgress: (id) => request(`/api/compose/tasks/${id}/progress`),
+  // 手动取消任务：计时停止，终态 canceled，不触发完成弹窗
+  cancelTask: (id) => request(`/api/compose/tasks/${id}/cancel`, { method: 'POST' })
 }

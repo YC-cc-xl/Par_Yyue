@@ -18,10 +18,11 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 FFMPEG_BIN_NAME = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
 
@@ -307,12 +308,109 @@ def _font_warnings(ffmpeg_log: str) -> list[str]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# ffmpeg 进程执行与「立即强杀」
+#   - 用 Popen 取代 subprocess.run：把进程句柄通过 on_spawn 交给调用方（任务是
+#     否取消由 is_canceled 判定），使外部可以在取消瞬间直接终止 ffmpeg
+#   - Windows 用 taskkill /T /F 连子进程一起杀，兜底 proc.kill()
+# ---------------------------------------------------------------------------
+
+def _remove_partial(path: Optional[Path]) -> None:
+    """删除被中断渲染留下的半成品文件（不存在则忽略）"""
+    if path is None:
+        return
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def terminate_process(proc: subprocess.Popen) -> None:
+    """立即终止 ffmpeg 进程（Windows 连子进程一起杀）"""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "taskkill.exe"
+        try:
+            subprocess.run(
+                [str(taskkill), "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+    if proc.poll() is None:  # taskkill 不可用时的兜底
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_ffmpeg(
+    command: list[str],
+    on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
+    on_release: Optional[Callable[[subprocess.Popen], None]] = None,
+    is_canceled: Optional[Callable[[], bool]] = None,
+    timeout: int = RENDER_TIMEOUT,
+) -> tuple[str, str, Optional[int], Optional[str]]:
+    """执行 ffmpeg，返回 (stdout, stderr, returncode, 执行异常标记)
+
+    异常标记：None=正常结束 / "timeout"=超时被终止 / "canceled"=任务取消被强杀
+    """
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        # 独立进程组：便于 taskkill /T 连同子进程一起回收
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **kwargs,
+    )
+    registered = False
+    try:
+        if on_spawn is not None:
+            on_spawn(proc)      # 交出句柄；若已取消，调用方会立刻杀它
+            registered = True
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            terminate_process(proc)
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            return out or "", err or "", proc.returncode, "timeout"
+    finally:
+        if registered and on_release is not None:
+            on_release(proc)
+
+    if is_canceled is not None and is_canceled():
+        return out or "", err or "", proc.returncode, "canceled"
+    return out or "", err or "", proc.returncode, None
+
+
 def render_episode(
     episode: dict[str, Any],
     out_file: Path,
     config: dict[str, Any],
     work_sub_name: str = "sub.ass",
     threads: Optional[int] = None,
+    on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
+    on_release: Optional[Callable[[subprocess.Popen], None]] = None,
+    is_canceled: Optional[Callable[[], bool]] = None,
 ) -> dict[str, Any]:
     """渲染单个分集
 
@@ -320,7 +418,8 @@ def render_episode(
     out_file: 输出视频路径
     config:   任务参数（bgm / subtitle / output）
     threads:  单个 ffmpeg 进程的编码线程数（页面「性能上限」）
-    返回: {"success", "output", "error", "log", "command"}
+    on_spawn / on_release / is_canceled: 进程句柄交出与取消判定（支持立即强杀）
+    返回: {"success", "output", "error", "log", "command"}；被强杀时附加 canceled=True
     """
     try:
         ffmpeg = require_ffmpeg()
@@ -366,28 +465,30 @@ def render_episode(
     command_text = _format_command(command)
 
     try:
-        process = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=RENDER_TIMEOUT,
+        stdout, stderr, returncode, exec_error = run_ffmpeg(
+            command, on_spawn=on_spawn, on_release=on_release, is_canceled=is_canceled
         )
-    except subprocess.TimeoutExpired:
-        return _fail(out_file, f"ffmpeg 渲染超时（超过 {RENDER_TIMEOUT} 秒）", command_text)
     except OSError as exc:
         return _fail(out_file, f"ffmpeg 启动失败：{exc}", command_text)
 
-    ffmpeg_log = (process.stdout or "") + "\n" + (process.stderr or "")
+    if exec_error == "timeout":
+        _remove_partial(out_file)
+        return _fail(out_file, f"ffmpeg 渲染超时（超过 {RENDER_TIMEOUT} 秒）", command_text)
+    if exec_error == "canceled":
+        # 任务取消被强杀：删除半成品，并标注 canceled 供调度层与真实失败区分
+        _remove_partial(out_file)
+        return {
+            **_fail(out_file, "任务已取消（ffmpeg 已终止）", command_text),
+            "canceled": True,
+        }
+
+    ffmpeg_log = stdout + "\n" + stderr
     warnings = _font_warnings(ffmpeg_log)
 
-    if process.returncode != 0:
+    if returncode != 0:
         # 取日志末尾若干行作为错误摘要，便于页面展示
-        tail = "\n".join(
-            line for line in (process.stderr or "").strip().splitlines()[-8:]
-        )
-        return _fail(out_file, f"ffmpeg 退出码 {process.returncode}：{tail}", command_text, ffmpeg_log)
+        tail = "\n".join(line for line in stderr.strip().splitlines()[-8:])
+        return _fail(out_file, f"ffmpeg 退出码 {returncode}：{tail}", command_text, ffmpeg_log)
 
     if not out_file.is_file():
         return _fail(out_file, "ffmpeg 正常退出但未生成输出文件", command_text, ffmpeg_log)
@@ -451,6 +552,9 @@ def concat_videos(
     width: Optional[int] = None,
     height: Optional[int] = None,
     bitrate: Optional[int] = None,
+    on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
+    on_release: Optional[Callable[[subprocess.Popen], None]] = None,
+    is_canceled: Optional[Callable[[], bool]] = None,
 ) -> dict[str, Any]:
     """用 concat 解复用器把多个视频首尾拼接
 
@@ -497,18 +601,22 @@ def concat_videos(
     command += ["-movflags", "+faststart", str(out_file)]
 
     try:
-        process = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=RENDER_TIMEOUT,
+        log_out, log_err, returncode, exec_error = run_ffmpeg(
+            command, on_spawn=on_spawn, on_release=on_release, is_canceled=is_canceled
         )
-    except subprocess.TimeoutExpired:
-        return _fail(out_file, f"视频拼接超时（超过 {RENDER_TIMEOUT} 秒）")
     except OSError as exc:
         return _fail(out_file, f"ffmpeg 启动失败：{exc}")
 
-    log = (process.stdout or "") + "\n" + (process.stderr or "")
-    if process.returncode != 0 or not out_file.is_file():
-        tail = "\n".join((process.stderr or "").strip().splitlines()[-8:])
-        return _fail(out_file, f"视频拼接失败（退出码 {process.returncode}）：{tail}", "", log)
+    if exec_error == "timeout":
+        _remove_partial(out_file)
+        return _fail(out_file, f"视频拼接超时（超过 {RENDER_TIMEOUT} 秒）")
+    if exec_error == "canceled":
+        _remove_partial(out_file)
+        return {**_fail(out_file, "任务已取消（拼接已终止）"), "canceled": True}
+
+    log = log_out + "\n" + log_err
+    if returncode != 0 or not out_file.is_file():
+        tail = "\n".join(log_err.strip().splitlines()[-8:])
+        return _fail(out_file, f"视频拼接失败（退出码 {returncode}）：{tail}", "", log)
 
     return {"success": True, "output": str(out_file), "error": "", "log": log}

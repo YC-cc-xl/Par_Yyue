@@ -7,6 +7,70 @@
     </div>
 
     <div class="page-body">
+      <!-- ================= 0. 全局统计栏 + 分集明细 ================= -->
+      <el-card shadow="never" class="panel">
+        <div class="global-stats">
+          <span class="stat-item">有效分集：<b>{{ scanSummary.validEpisodeTotal }}</b> 个</span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">配音文件：<b>{{ scanSummary.audioTotal }}</b> 个</span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">视频素材：<b>{{ scanSummary.videoTotal }}</b> 个</span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">
+            当前阶段：
+            <el-tag :type="stageTagType" size="small" effect="plain">{{ stageLabel }}</el-tag>
+          </span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">已运行：<b>{{ elapsedText }}</b></span>
+        </div>
+
+        <!-- 一行 = 一个分集文件夹 -->
+        <el-table
+          v-if="episodeDetail.length"
+          :data="episodeDetail"
+          size="small"
+          border
+          stripe
+          class="mt8"
+          max-height="280"
+        >
+          <el-table-column type="index" label="#" width="52" align="center" />
+          <el-table-column prop="name" label="分集目录" min-width="170" show-overflow-tooltip />
+          <el-table-column prop="audioCount" label="音频" width="76" align="center" />
+          <el-table-column prop="videoCount" label="视频" width="76" align="center" />
+          <el-table-column label="分集进度" min-width="170">
+            <template #default="{ row }">
+              <el-progress
+                :percentage="row.progress || 0"
+                :status="rowProgressStatus(row)"
+                :stroke-width="10"
+              />
+            </template>
+          </el-table-column>
+          <el-table-column label="分集状态" width="100" align="center">
+            <template #default="{ row }">
+              <span :style="{ color: rowStatusColor(row.status) }">{{ rowStatusLabel(row.status) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-else description="尚未扫描，暂无分集明细" :image-size="60" />
+      </el-card>
+
+      <!-- ================= 全局总进度（表格下方、日志窗口上方） ================= -->
+      <el-card shadow="never" class="panel">
+        <div class="row-inline">
+          <el-progress
+            class="global-progress"
+            :percentage="globalProgress"
+            :status="globalProgressStatus"
+            :stroke-width="14"
+          />
+          <span class="progress-text">
+            {{ globalProgress }}% (已完成 {{ groupProgress.done }} / 总共 {{ groupProgress.total }})
+          </span>
+        </div>
+      </el-card>
+
       <!-- ================= 1. 参数预设 ================= -->
       <el-card shadow="never" class="panel">
         <template #header><span class="panel-title">参数预设</span></template>
@@ -186,8 +250,8 @@
         </template>
         <div class="row-inline">
           <span class="stat">总分集：<b>{{ task.total }}</b></span>
-          <span class="stat success">成功：<b>{{ task.success }}</b></span>
-          <span class="stat danger">失败：<b>{{ task.failed }}</b></span>
+          <span class="stat success">成功组：<b>{{ task.success }}</b></span>
+          <span class="stat danger">失败组：<b>{{ task.failed }}</b></span>
         </div>
         <el-progress class="mt8" :percentage="task.progress" :status="taskStatus" :stroke-width="14" />
         <div class="log-title">运行日志</div>
@@ -198,7 +262,17 @@
     <!-- ================= 底部操作栏 ================= -->
     <div class="page-footer">
       <span class="footer-tip">{{ footerTip }}</span>
-      <el-button type="primary" size="large" :loading="submitting" :disabled="scanning" @click="handleStartCompose">
+      <el-button
+        v-if="isTaskRunning"
+        type="warning"
+        plain
+        size="large"
+        :loading="canceling"
+        @click="handleCancelTask"
+      >
+        取消任务
+      </el-button>
+      <el-button type="primary" size="large" :loading="submitting" :disabled="scanning || isTaskRunning" @click="handleStartCompose">
         开始合成
       </el-button>
     </div>
@@ -247,6 +321,24 @@
       <template #footer>
         <el-button @click="subtitleDialog = false">取消</el-button>
         <el-button type="primary" @click="handleConfirmSubtitleStyle">确定</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ================= 弹窗：任务结束提示（全部成功 / 存在失败项） ================= -->
+    <!-- 仅【确定】关闭按钮；中途手动取消任务不弹此窗 -->
+    <el-dialog
+      v-model="completionDialog"
+      :title="completionInfo.title"
+      width="420px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="false"
+      :show-close="false"
+    >
+      <div class="completion-line">总耗时：<b>{{ completionInfo.elapsed }}</b></div>
+      <div class="completion-line">成功组数：<b>{{ completionInfo.success }}</b> 组</div>
+      <div class="completion-line">失败组数：<b>{{ completionInfo.failed }}</b> 组</div>
+      <template #footer>
+        <el-button type="primary" @click="completionDialog = false">确定</el-button>
       </template>
     </el-dialog>
   </div>
@@ -304,6 +396,39 @@ const scanStatus = ref('')
 const scanStatusType = ref('info')
 const episodes = ref([])
 
+// ---------- 全局统计栏 / 分集明细（扫描接口新增返回的 summary + detail） ----------
+const scanSummary = ref({
+  episodeTotal: 0,
+  validEpisodeTotal: 0,
+  audioTotal: 0,
+  videoTotal: 0
+})
+const episodeDetail = ref([])
+// 全局总进度（按「有效素材组」计）：已完成组数 / 总组数
+const groupProgress = ref({ done: 0, total: 0 })
+// 当前阶段：ready 准备就绪 / running 处理中 / completed 全部完成 / partial 部分失败
+const composeStage = ref('ready')
+
+// ---------- 已运行时长（全局计时，统计栏实时刷新） ----------
+// 数值以后端任务状态接口返回的 elapsedSeconds 为准；任务结束（终态）后计时停止
+const elapsedSeconds = ref(0)
+const elapsedText = computed(() => formatDuration(elapsedSeconds.value))
+
+// ---------- 任务结束弹窗（全部成功 / 存在失败项，仅【确定】关闭） ----------
+const completionDialog = ref(false)
+const completionInfo = reactive({ title: '', elapsed: '00:00:00', success: 0, failed: 0 })
+// 守卫：同一个任务只弹一次（轮询可能重复读到终态）
+const completionNotifiedId = ref(null)
+
+// 秒数 → 时:分:秒（如 00:02:15）
+function formatDuration(totalSeconds) {
+  const total = Math.max(0, Math.floor(Number(totalSeconds) || 0))
+  const h = String(Math.floor(total / 3600)).padStart(2, '0')
+  const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0')
+  const s = String(total % 60).padStart(2, '0')
+  return `${h}:${m}:${s}`
+}
+
 // ---------- 字幕样式弹窗 ----------
 const subtitleDialog = ref(false)
 // 草稿：确认后才写回 form.subtitleStyle，取消不影响原值
@@ -311,8 +436,12 @@ const styleDraft = reactive({ ...form.subtitleStyle })
 
 // ---------- 任务与轮询 ----------
 const submitting = ref(false)
+const canceling = ref(false)
 const task = ref(null)
 let pollTimer = null
+
+// 任务是否仍在进行（进行中才展示【取消任务】按钮）
+const isTaskRunning = computed(() => ['pending', 'running'].includes(task.value?.status))
 
 // ---------- 派生展示 ----------
 const positionLabel = computed(() => {
@@ -326,13 +455,30 @@ const footerTip = computed(() => {
   return `共 ${episodes.value.length} 集待合成`
 })
 
+// 当前阶段文案 / 标签色（统计栏第 4 项）
+const stageLabel = computed(() => {
+  const map = {
+    ready: '准备就绪',
+    running: '处理中',
+    completed: '全部完成',
+    partial: '部分失败',
+    canceled: '已取消'
+  }
+  return map[composeStage.value] || '准备就绪'
+})
+
+const stageTagType = computed(() => {
+  const map = { ready: 'info', running: 'warning', completed: 'success', partial: 'danger', canceled: 'info' }
+  return map[composeStage.value] || 'info'
+})
+
 const taskStatusLabel = computed(() => {
-  const map = { pending: '等待中', running: '合成中', completed: '已完成', failed: '失败' }
+  const map = { pending: '等待中', running: '合成中', completed: '已完成', failed: '失败', canceled: '已取消' }
   return map[task.value?.status] || '未知'
 })
 
 const taskTagType = computed(() => {
-  const map = { pending: 'info', running: 'warning', completed: 'success', failed: 'danger' }
+  const map = { pending: 'info', running: 'warning', completed: 'success', failed: 'danger', canceled: 'info' }
   return map[task.value?.status] || 'info'
 })
 
@@ -342,6 +488,56 @@ const taskStatus = computed(() => {
   if (task.value?.status === 'failed') return 'exception'
   return undefined
 })
+
+// ---------- 全局总进度条 ----------
+// 进度数值 = 已完成渲染的素材组数 ÷ 全部有效素材组数
+const globalProgress = computed(() => {
+  const { done, total } = groupProgress.value
+  if (total > 0) return Math.min(100, Math.round((done / total) * 100))
+  return Math.round(Number(task.value?.progress) || 0)
+})
+
+const globalProgressStatus = computed(() => {
+  if (!task.value) return undefined
+  if (composeStage.value === 'completed') return 'success'
+  if (composeStage.value === 'partial') return 'exception'
+  return undefined
+})
+
+// ---------- 分集行：进度 / 状态 ----------
+const EPISODE_STATUS_TEXT = { pending: '待处理', running: '渲染中', success: '成功', failed: '失败' }
+const EPISODE_STATUS_COLOR = { pending: '#909399', running: '#409eff', success: '#67c23a', failed: '#f56c6c' }
+
+function rowStatusLabel(status) {
+  return EPISODE_STATUS_TEXT[status] || EPISODE_STATUS_TEXT.pending
+}
+
+function rowStatusColor(status) {
+  return EPISODE_STATUS_COLOR[status] || EPISODE_STATUS_COLOR.pending
+}
+
+function rowProgressStatus(row) {
+  if (row.status === 'success') return 'success'
+  if (row.status === 'failed') return 'exception'
+  return undefined
+}
+
+// 把轮询到的分集运行态合并进明细行（保留扫描得到的静态字段）
+function applyEpisodeProgress(rows) {
+  if (!rows || !rows.length) return
+  const runtimeMap = new Map(rows.map((item) => [item.index, item]))
+  episodeDetail.value = episodeDetail.value.map((row) => {
+    const runtime = runtimeMap.get(row.index)
+    if (!runtime) return row
+    return {
+      ...row,
+      progress: runtime.total ? (runtime.done / runtime.total) * 100 : 0,
+      status: runtime.status,
+      done: runtime.done,
+      total: runtime.total
+    }
+  })
+}
 
 // ---------- 1. 参数预设 ----------
 // 加载预设列表（阶段8 联调）
@@ -432,9 +628,17 @@ async function handleBrowseSource() {
   const selected = await window.electronAPI?.selectFolder?.()
   if (selected) {
     form.sourceDir = selected
-    // 目录变化后清空旧的分集清单
+    // 目录变化后清空旧的分集清单与统计栏数据
     episodes.value = []
     scanStatus.value = ''
+    scanSummary.value = { episodeTotal: 0, validEpisodeTotal: 0, audioTotal: 0, videoTotal: 0 }
+    episodeDetail.value = []
+    groupProgress.value = { done: 0, total: 0 }
+    composeStage.value = 'ready'
+    // 目录变更：计时归零，允许新任务结束弹窗
+    elapsedSeconds.value = 0
+    completionDialog.value = false
+    completionNotifiedId.value = null
   }
 }
 
@@ -451,10 +655,32 @@ async function handleScan() {
   try {
     const res = await api.scanFolder(form.sourceDir)
     episodes.value = res?.episodes || []
+    // 统计栏 + 分集明细（兼容旧后端：缺少 summary/detail 时按已有字段退化计算）
+    episodeDetail.value = (res?.detail || []).map((item) => ({
+      ...item,
+      progress: 0,
+      status: 'pending'
+    }))
+    scanSummary.value = res?.summary || {
+      episodeTotal: episodes.value.length,
+      validEpisodeTotal: episodes.value.filter((ep) => (ep.groups || []).length).length,
+      audioTotal: episodes.value.reduce((sum, ep) => sum + (ep.groups || []).length, 0),
+      videoTotal: episodes.value.reduce((sum, ep) => sum + (ep.videoCount || 0), 0)
+    }
+    // 新一轮扫描：全局进度归零，总组数 = 全部有效素材组数
+    groupProgress.value = { done: 0, total: scanSummary.value.audioTotal }
+    // 扫描完成且尚未开始渲染 → 准备就绪；计时归零，允许下次任务结束弹窗
+    composeStage.value = 'ready'
+    elapsedSeconds.value = 0
+    completionDialog.value = false
+    completionNotifiedId.value = null
     scanStatus.value = `扫描完成：共 ${res?.total ?? episodes.value.length} 集`
     scanStatusType.value = 'success'
   } catch (e) {
     episodes.value = []
+    scanSummary.value = { episodeTotal: 0, validEpisodeTotal: 0, audioTotal: 0, videoTotal: 0 }
+    episodeDetail.value = []
+    groupProgress.value = { done: 0, total: 0 }
     scanStatus.value = `扫描失败：${e.message}（需先启动后端服务）`
     scanStatusType.value = 'error'
   } finally {
@@ -531,11 +757,37 @@ async function handleStartCompose() {
       log: ''
     }
     ElMessage.success('合成任务已创建')
+    // 已开始渲染 → 处理中；进度归零重新计（总组数沿用扫描到的有效素材组数）
+    composeStage.value = 'running'
+    groupProgress.value = { done: 0, total: groupProgress.value.total }
+    // 计时起点 = 后端记录的任务起始时间戳；新任务允许再次弹窗
+    elapsedSeconds.value = res?.elapsedSeconds ?? 0
+    completionNotifiedId.value = null
     startPolling()
   } catch (e) {
     ElMessage.error(`创建任务失败：${e.message}（需先启动后端服务）`)
   } finally {
     submitting.value = false
+  }
+}
+
+// 手动取消任务：计时停止、终态 canceled，不弹完成弹窗
+async function handleCancelTask() {
+  if (!task.value?.id) return
+  canceling.value = true
+  try {
+    await api.cancelTask(task.value.id)
+    ElMessage.success('已取消任务')
+    stopPolling()
+    composeStage.value = 'canceled'
+    // 守卫：本任务不再触发任务结束弹窗
+    completionNotifiedId.value = task.value.id
+    // 拉取一次最终状态（计时在取消时刻停止）
+    await refreshTask()
+  } catch (e) {
+    ElMessage.error(`取消失败：${e.message}`)
+  } finally {
+    canceling.value = false
   }
 }
 
@@ -555,13 +807,48 @@ function stopPolling() {
 async function refreshTask() {
   if (!task.value?.id) return
   try {
-    const res = await api.getTask(task.value.id)
+    // 进度接口同时返回任务状态/日志、各分集运行态与全局已运行时长，一次请求即可刷新全部区域
+    const res = await api.getTaskProgress(task.value.id)
     if (!res) return
     task.value = { ...task.value, ...res }
-    if (res.status === 'completed' || res.status === 'failed') stopPolling()
+    // 全局总进度：已完成渲染的素材组数 / 全部有效素材组数
+    groupProgress.value = { done: res.doneGroups ?? 0, total: res.totalGroups ?? 0 }
+    // 已运行时长：以后端起始时间戳推导的秒数为准，随轮询实时刷新
+    elapsedSeconds.value = res.elapsedSeconds ?? elapsedSeconds.value
+    applyEpisodeProgress(res.episodes)
+    if (res.status === 'canceled') {
+      // 手动取消：计时在取消时刻停止，进度不再更新，且不弹完成弹窗
+      stopPolling()
+      elapsedSeconds.value = res.elapsedSeconds ?? elapsedSeconds.value
+      composeStage.value = 'canceled'
+      completionNotifiedId.value = task.value.id
+      return
+    }
+    if (res.status === 'completed' || res.status === 'failed') {
+      stopPolling()
+      // 全部成功 → 全部完成；只要有素材组失败 → 部分失败
+      composeStage.value = res.status === 'completed' && !res.failed ? 'completed' : 'partial'
+      // 终态：计时停止（保留最终 elapsedSeconds），弹一次结束弹窗
+      showCompletion(res)
+    }
   } catch {
     // 轮询失败保持静默，等待下次重试
   }
+}
+
+// 任务执行完毕弹窗：全部成功 → 【任务全部完成】；存在失败 → 【任务处理完毕（存在失败项）】
+// 同一任务只弹一次；中途手动取消任务不会走到终态，因此不弹此窗
+function showCompletion(res) {
+  const id = task.value?.id
+  if (id == null || completionNotifiedId.value === id) return
+  completionNotifiedId.value = id
+  const success = res.success ?? task.value?.success ?? 0
+  const failed = res.failed ?? task.value?.failed ?? 0
+  completionInfo.title = failed > 0 ? '任务处理完毕（存在失败项）' : '任务全部完成'
+  completionInfo.elapsed = res.elapsed || formatDuration(elapsedSeconds.value)
+  completionInfo.success = success
+  completionInfo.failed = failed
+  completionDialog.value = true
 }
 
 // 组件卸载时清理定时器
@@ -631,6 +918,16 @@ loadPresets()
   flex-wrap: wrap;
   gap: 10px;
 }
+/* 全局总进度：进度条占满，右侧同步显示组数文字 */
+.global-progress {
+  flex: 1;
+  min-width: 240px;
+}
+.progress-text {
+  color: #606266;
+  font-size: 13px;
+  white-space: nowrap;
+}
 .mt8 {
   margin-top: 8px;
 }
@@ -647,6 +944,13 @@ loadPresets()
 .value-text {
   color: #909399;
   font-size: 13px;
+}
+
+/* 任务结束弹窗内容行 */
+.completion-line {
+  line-height: 30px;
+  font-size: 14px;
+  color: #606266;
 }
 .unit-text {
   color: #909399;
@@ -686,6 +990,26 @@ loadPresets()
   color: #909399;
   line-height: 1.7;
   word-break: break-all;
+}
+
+/* 全局统计栏（4 项文字信息并排） */
+.global-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.global-stats .stat-item {
+  font-size: 14px;
+  color: #606266;
+}
+.global-stats .stat-item b {
+  color: #303133;
+  font-weight: 600;
+  padding: 0 2px;
+}
+.global-stats .stat-divider {
+  color: #dcdfe6;
+  margin: 0 12px;
 }
 
 /* 统计文字 */

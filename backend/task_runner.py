@@ -14,13 +14,21 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import models
-from ffmpeg_render import render_episode, concat_videos, locate_ffmpeg, FfmpegNotFound
+from ffmpeg_render import (
+    render_episode,
+    concat_videos,
+    locate_ffmpeg,
+    terminate_process,
+    FfmpegNotFound,
+)
 from scanner import scan_episodes, OUTPUT_DIR_NAME
 
 # 输出目录（相对处理来源根目录）
@@ -28,6 +36,124 @@ MERGE_FILE_NAME = "合并视频.mp4"
 
 # 任务日志中单集 ffmpeg 输出的保留行数
 LOG_TAIL_LINES = 12
+
+# ---------------------------------------------------------------------------
+# 运行时进度注册表（供 GET /api/compose/tasks/{id}/progress 读取）
+#   task_id → { totalGroups, doneGroups, success, failed,
+#               episodes: { 分集序号: {index,name,total,done,success,failed,status,
+#                                     startTs,endTs,duration,durationText} } }
+# 只在内存中维护：后端重启后任务本身就中断了，不需要持久化。
+# ---------------------------------------------------------------------------
+_RUN_STATE: dict[int, dict[str, Any]] = {}
+
+# 同时保护注册表与渲染过程中的统计/日志写入，保证进度不被读到中间态
+_STATE_LOCK = threading.RLock()
+
+# 取消意向：任务尚未登记到注册表（仍在扫描阶段）时先记在这里，
+# 待 _execute 注册运行时状态后立即采纳，避免「点取消但来不及生效」的竞态
+_CANCEL_REQUESTED: set[int] = set()
+
+# 取消时刻（wall clock）：取消后线程池收尾仍会写日志、更新 updated_at，
+# 为了让「已运行时长」在取消瞬间定格，这里单独记下取消时刻供接口换算
+_CANCEL_AT: dict[int, float] = {}
+
+# 运行中的 ffmpeg 进程：task_id → {Popen}，供取消时「立即强杀」
+_PROCS: dict[int, set[subprocess.Popen]] = {}
+
+
+def get_cancel_at(task_id: int) -> float | None:
+    """返回任务的取消时刻（epoch 秒），未取消返回 None"""
+    with _STATE_LOCK:
+        return _CANCEL_AT.get(task_id)
+
+
+def register_proc(task_id: int, proc: subprocess.Popen) -> None:
+    """登记刚启动的 ffmpeg 进程；若该任务已取消则立刻终止（关闭竞态窗口）"""
+    with _STATE_LOCK:
+        _PROCS.setdefault(task_id, set()).add(proc)
+        canceled = bool((_RUN_STATE.get(task_id) or {}).get("canceled"))
+    if canceled:
+        terminate_process(proc)
+
+
+def release_proc(task_id: int, proc: subprocess.Popen) -> None:
+    """渲染结束后出表"""
+    with _STATE_LOCK:
+        procs = _PROCS.get(task_id)
+        if procs is not None:
+            procs.discard(proc)
+
+
+def kill_task_procs(task_id: int) -> int:
+    """立即强杀该任务当前所有在跑的 ffmpeg 进程（先取快照，出锁后再杀）"""
+    with _STATE_LOCK:
+        procs = list(_PROCS.get(task_id) or ())
+    for proc in procs:
+        terminate_process(proc)
+    return len(procs)
+
+
+def is_task_canceled(task_id: int) -> bool:
+    """该任务是否已被请求取消"""
+    with _STATE_LOCK:
+        state = _RUN_STATE.get(task_id)
+        return bool(state and state.get("canceled"))
+
+
+def request_cancel(task_id: int) -> bool:
+    """请求取消任务：置标志 + 记录取消时刻 + 立即强杀在跑的 ffmpeg
+
+    返回 True 表示取消请求已受理；False 表示该任务已在取消中。
+    """
+    with _STATE_LOCK:
+        state = _RUN_STATE.get(task_id)
+        if state is None:
+            # 仍在扫描阶段：先记意向，_execute 注册运行态后会立即采纳
+            _CANCEL_REQUESTED.add(task_id)
+            _CANCEL_AT[task_id] = time.time()
+        elif state.get("canceled"):
+            return False
+        else:
+            state["canceled"] = True
+            _CANCEL_AT[task_id] = time.time()
+    # 出锁后再强杀，避免持锁等待 taskkill
+    kill_task_procs(task_id)
+    return True
+
+
+def _format_duration(seconds: float) -> str:
+    """秒数 → 时:分:秒（如 00:02:15）"""
+    total = int(round(max(0.0, float(seconds))))
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def get_task_progress(task_id: int) -> dict[str, Any] | None:
+    """读取任务的进度快照（任务不存在或未开始返回 None）"""
+    with _STATE_LOCK:
+        state = _RUN_STATE.get(task_id)
+        if state is None:
+            return None
+        return {
+            "totalGroups": state["totalGroups"],
+            "doneGroups": state["doneGroups"],
+            "success": state["success"],
+            "failed": state["failed"],
+            # 分集条目：追加本集渲染耗时（duration 秒 / durationText 时:分:秒）
+            "episodes": [
+                {
+                    "index": ep["index"],
+                    "name": ep["name"],
+                    "total": ep["total"],
+                    "done": ep["done"],
+                    "success": ep["success"],
+                    "failed": ep["failed"],
+                    "status": ep["status"],
+                    "duration": ep.get("duration"),
+                    "durationText": ep.get("durationText") or "",
+                }
+                for ep in sorted(state["episodes"].values(), key=lambda ep: ep["index"])
+            ],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +222,11 @@ def _run_task(task_id: int) -> None:
     except Exception as exc:  # 兜底：任何未预期异常都不能让任务卡在 running
         models.append_task_log(task_id, f"[错误] 任务执行异常：{exc}")
         models.update_task(task_id, status="failed")
+    finally:
+        # 收尾：清掉该任务的进程登记，避免长期运行后注册表无限增长
+        with _STATE_LOCK:
+            _PROCS.pop(task_id, None)
+            _CANCEL_REQUESTED.discard(task_id)
 
 
 def _execute(task_id: int, task: dict[str, Any]) -> None:
@@ -129,89 +260,218 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
     threads = _resolve_threads(config)
     output_cfg = config.get("output") or {}
 
-    models.update_task(task_id, total=len(episodes), status="running")
+    # ---- 2. 组装渲染工作项：一组「合格素材（mp4+mp3+srt 同名）」= 一个渲染单位 ----
+    jobs: list[dict[str, Any]] = []
+    for episode in episodes:
+        for group in episode.get("groups") or []:
+            jobs.append(
+                {
+                    "index": episode["index"],
+                    "name": episode["name"],
+                    "groupName": group["name"],
+                    "videoPath": group["videoPath"],
+                    "audioPath": group["audioPath"],
+                    "subtitlePath": group["subtitlePath"],
+                    "missing": [],
+                }
+            )
+
+    # 运行时进度：全局 + 每个分集独立维护，供前端表格逐行显示进度与状态
+    state: dict[str, Any] = {
+        "totalGroups": len(jobs),
+        "doneGroups": 0,
+        "success": 0,
+        "failed": 0,
+        "canceled": False,
+        "episodes": {
+            episode["index"]: {
+                "index": episode["index"],
+                "name": episode["name"],
+                "total": len(episode.get("groups") or []),
+                "done": 0,
+                "success": 0,
+                "failed": 0,
+                "status": "pending",
+                # 分集渲染耗时：startTs/endTs 取该集所有组中最早的开始与最晚的结束
+                "startTs": None,
+                "endTs": None,
+                "duration": None,
+                "durationText": "",
+            }
+            for episode in episodes
+        },
+    }
+    with _STATE_LOCK:
+        _RUN_STATE[task_id] = state
+        # 采纳「扫描阶段就已点击取消」的意向，避免取消请求丢失
+        if task_id in _CANCEL_REQUESTED:
+            _CANCEL_REQUESTED.discard(task_id)
+            state["canceled"] = True
+    canceled = state["canceled"]
+
+    models.update_task(task_id, total=len(episodes), success=0, failed=0, progress=0.0, status="running")
     models.append_task_log(task_id, "=" * 60)
-    models.append_task_log(task_id, f"[任务] 共 {len(episodes)} 集，并发数 {workers}，每进程编码线程 {threads}")
+    models.append_task_log(
+        task_id,
+        f"[任务] 共 {len(episodes)} 集，有效素材 {len(jobs)} 组，并发数 {workers}，"
+        f"每进程编码线程 {threads}",
+    )
     models.append_task_log(
         task_id,
         f"[任务] 分辨率 {output_cfg.get('width', 1280)}×{output_cfg.get('height', 720)}，"
         f"码率 {output_cfg.get('bitrate', 2000)}kbps，输出目录：{output_root}",
     )
+
+    # 被跳过的素材逐条提示，明确告知缺少哪个文件（不统计、不渲染）
+    for episode in episodes:
+        for reason in episode.get("skipped") or []:
+            models.append_task_log(task_id, f"[第{episode['index']}集 {episode['name']}] 跳过 {reason}")
     models.append_task_log(task_id, "=" * 60)
 
-    # ---- 2. 并发渲染各分集 ----
-    lock = threading.Lock()
-    stats = {"done": 0, "success": 0, "failed": 0}
-    outputs: dict[int, Path] = {}          # 分集序号 → 输出文件
-    episode_by_index = {ep["index"]: ep for ep in episodes}
+    if not jobs:
+        models.append_task_log(task_id, "[错误] 没有任何一组合格素材（视频/音频需同名配对），无法开始渲染")
+        models.update_task(task_id, progress=0.0, status="failed")
+        return
 
-    def render_one(episode: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Path]:
-        """渲染单个分集（在线程池中执行）"""
-        out_file = output_root / f"{episode['name']}.mp4"
+    # ---- 3. 并发渲染各素材组 ----
+    # 输出结构：自动合成输出/<分集目录名>/<素材组名>.mp4（同一分集多组互不覆盖）
+    outputs: dict[int, list[tuple[str, Path]]] = {}   # 分集序号 → [(组名, 输出文件)]
 
-        # 视频/配音缺失的分集直接判定失败，不进入 ffmpeg
-        if episode.get("missing"):
-            return episode, {
-                "success": False,
-                "error": f"缺少{'、'.join(episode['missing'])}文件",
-                "log": "",
-                "command": "",
-                "warnings": [],
-            }, out_file
+    # 取消意向在渲染开始前就已生效 → 直接收敛，不提交任何渲染任务
+    if state["canceled"]:
+        models.append_task_log(task_id, "[取消] 任务在开始渲染前已被取消")
+        models.update_task(task_id, status="canceled")
+        return
 
+    def render_one(job: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Path, float, float]:
+        """渲染单组素材（在线程池中执行），并记录该组的起止时间戳"""
+        episode_dir = output_root / job["name"]
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        out_file = episode_dir / f"{job['groupName']}.mp4"
+
+        started = time.monotonic()
         result = render_episode(
-            episode,
+            job,
             out_file,
             config,
-            work_sub_name=f"sub_{task_id}_{episode['index']:03d}.ass",
+            work_sub_name=f"sub_{task_id}_{job['index']:03d}_{job['groupName']}.ass",
             threads=threads,
+            # 交出 ffmpeg 句柄：取消时可立即强杀；is_canceled 用于区分「被强杀」与真实失败
+            on_spawn=lambda proc: register_proc(task_id, proc),
+            on_release=lambda proc: release_proc(task_id, proc),
+            is_canceled=lambda: state["canceled"],
         )
-        _write_episode_log(log_dir / f"{episode['name']}.log", episode, result)
-        return episode, result, out_file
+        ended = time.monotonic()
+        _write_episode_log(log_dir / f"{job['name']}__{job['groupName']}.log", job, result)
+        return job, result, out_file, started, ended
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="render") as pool:
-        futures = {pool.submit(render_one, ep): ep for ep in episodes}
+        futures = {pool.submit(render_one, job): job for job in jobs}
         for future in as_completed(futures):
-            episode = futures[future]
-            label = f"[第{episode['index']}集 {episode['name']}]"
+            job = futures[future]
+            label = f"[第{job['index']}集 {job['name']} · {job['groupName']}]"
+            started = ended = None
             try:
-                episode, result, out_file = future.result()
-            except Exception as exc:  # 单集异常不影响其它分集
-                episode, result, out_file = episode, {"success": False, "error": f"渲染线程异常：{exc}"}, None
+                job, result, out_file, started, ended = future.result()
+            except Exception as exc:  # 单组异常不影响其它素材组
+                job, result, out_file = job, {"success": False, "error": f"渲染线程异常：{exc}"}, None
 
-            with lock:
-                stats["done"] += 1
-                if result.get("success"):
-                    stats["success"] += 1
-                    outputs[episode["index"]] = out_file
-                    models.append_task_log(task_id, f"{label} 成功 → {out_file}")
-                    for warning in result.get("warnings") or []:
-                        models.append_task_log(task_id, f"{label} 警告：{warning}")
+            with _STATE_LOCK:
+                episode_state = state["episodes"][job["index"]]
+
+                if result.get("canceled"):
+                    # 被取消强杀：不计入 failed、不推进进度，仅记录终止日志
+                    models.append_task_log(task_id, f"{label} 已终止（任务取消）")
                 else:
-                    stats["failed"] += 1
-                    models.append_task_log(task_id, f"{label} 失败：{result.get('error', '未知错误')}")
-                    for line in _tail_lines(result.get("log") or "", LOG_TAIL_LINES):
-                        models.append_task_log(task_id, f"{label} | {line}")
+                    episode_state["done"] += 1
 
-                progress = stats["done"] / len(episodes) * 100.0
-                models.update_task(
-                    task_id,
-                    success=stats["success"],
-                    failed=stats["failed"],
-                    progress=progress,
-                )
+                    # 分集渲染耗时：取该集所有组中最早的开始、最晚的结束
+                    if started is not None and (
+                        episode_state["startTs"] is None or started < episode_state["startTs"]
+                    ):
+                        episode_state["startTs"] = started
+                    if ended is not None and (
+                        episode_state["endTs"] is None or ended > episode_state["endTs"]
+                    ):
+                        episode_state["endTs"] = ended
 
-    # ---- 3. 合并视频 ----
-    if output_cfg.get("mergeVideo"):
-        _build_merged(task_id, config, output_root, outputs, episode_by_index)
+                    if result.get("success"):
+                        state["success"] += 1
+                        episode_state["success"] += 1
+                        if out_file is not None:
+                            outputs.setdefault(job["index"], []).append((job["groupName"], out_file))
+                        models.append_task_log(task_id, f"{label} 成功 → {out_file}")
+                        for warning in result.get("warnings") or []:
+                            models.append_task_log(task_id, f"{label} 警告：{warning}")
+                    else:
+                        state["failed"] += 1
+                        episode_state["failed"] += 1
+                        models.append_task_log(task_id, f"{label} 失败：{result.get('error', '未知错误')}")
+                        for line in _tail_lines(result.get("log") or "", LOG_TAIL_LINES):
+                            models.append_task_log(task_id, f"{label} | {line}")
 
-    # ---- 4. 收敛任务状态 ----
+                    state["doneGroups"] += 1
+                    # 分集状态：有失败 → failed；全部完成且无失败 → success；否则渲染中
+                    if episode_state["failed"]:
+                        episode_state["status"] = "failed"
+                    elif episode_state["total"] and episode_state["done"] >= episode_state["total"]:
+                        episode_state["status"] = "success"
+                    else:
+                        episode_state["status"] = "running"
+
+                    # 该集所有组都已返回 → 结算本集渲染耗时并写入日志（存入任务数据）
+                    if (
+                        episode_state["total"]
+                        and episode_state["done"] >= episode_state["total"]
+                        and not episode_state["durationText"]
+                    ):
+                        duration = max(
+                            0.0, (episode_state["endTs"] or 0.0) - (episode_state["startTs"] or 0.0)
+                        )
+                        episode_state["duration"] = round(duration, 3)
+                        episode_state["durationText"] = _format_duration(duration)
+                        models.append_task_log(
+                            task_id,
+                            f"[第{job['index']}集 {job['name']}] 本集渲染完成，耗时 {episode_state['durationText']}",
+                        )
+
+                    models.update_task(
+                        task_id,
+                        success=state["success"],
+                        failed=state["failed"],
+                        progress=state["doneGroups"] / state["totalGroups"] * 100.0,
+                    )
+
+            # 已请求取消：当前这组（可能已被强杀）处理完后，撤销尚未开始的组并停止
+            if state["canceled"]:
+                for pending in futures:
+                    pending.cancel()
+                break
+
+    # ---- 4. 合并视频（取消时跳过，避免继续产出半成品合并件） ----
+    if state["canceled"]:
+        models.append_task_log(task_id, "[取消] 任务已取消，跳过合并视频")
+    elif output_cfg.get("mergeVideo"):
+        _build_merged(task_id, config, output_root, outputs, episodes)
+
+    # ---- 5. 收敛任务状态 ----
+    if state["canceled"]:
+        # 取消：不把进度推到 100%，进度条保持停止更新；最终状态 canceled（终态）
+        models.update_task(task_id, status="canceled")
+        models.append_task_log(
+            task_id,
+            f"[取消] 任务已取消，成功 {state['success']} 组，失败 {state['failed']} 组，"
+            f"已完成 {state['doneGroups']} / {state['totalGroups']} 组素材",
+        )
+        return
+
     models.update_task(task_id, progress=100.0)
-    final_status = "completed" if stats["success"] > 0 else "failed"
+    final_status = "completed" if state["success"] > 0 else "failed"
     models.update_task(task_id, status=final_status)
     models.append_task_log(
         task_id,
-        f"[完成] 成功 {stats['success']} 集，失败 {stats['failed']} 集，共 {len(episodes)} 集",
+        f"[完成] 成功 {state['success']} 组，失败 {state['failed']} 组，"
+        f"共 {len(episodes)} 集 / {state['totalGroups']} 组素材",
     )
 
 
@@ -223,25 +483,27 @@ def _build_merged(
     task_id: int,
     config: dict[str, Any],
     output_root: Path,
-    outputs: dict[int, Path],
-    episode_by_index: dict[int, dict[str, Any]],
+    outputs: dict[int, list[tuple[str, Path]]],
+    episodes: list[dict[str, Any]],
 ) -> None:
     """按页面选项生成合并视频
 
-    - 创建合并视频：把全部成功分集按序号首尾拼接
-    - 合并原视频与第一集：在合并视频最前面拼接【第一集的原始视频】（作为片头）
-      （此语义以页面文案直译实现，如与预期不符请告知调整）
+    - 创建合并视频：把全部成功素材组按「分集序号 → 组名」顺序首尾拼接
+    - 合并原视频与第一集：在合并视频最前面拼接【第一集第一组素材的原始视频】（作为片头）
     """
     output_cfg = config.get("output") or {}
-    ordered = [outputs[index] for index in sorted(outputs)]
+    ordered: list[Path] = []
+    for index in sorted(outputs):
+        for _, out_file in sorted(outputs[index], key=lambda item: item[0].lower()):
+            ordered.append(out_file)
     if not ordered:
-        models.append_task_log(task_id, "[合并] 没有可合并的成功分集，跳过合并")
+        models.append_task_log(task_id, "[合并] 没有可合并的成功素材组，跳过合并")
         return
 
     parts: list[Path] = []
     if output_cfg.get("mergeWithFirst"):
-        first = episode_by_index.get(min(episode_by_index)) if episode_by_index else None
-        first_video = Path(first["videoPath"]) if first and first.get("videoPath") else None
+        first_episode = next((ep for ep in episodes if ep.get("groups")), None)
+        first_video = Path(first_episode["groups"][0]["videoPath"]) if first_episode else None
         if first_video and first_video.is_file():
             parts.append(first_video)
             models.append_task_log(task_id, f"[合并] 已加入第一集原视频作为片头：{first_video.name}")
@@ -253,6 +515,13 @@ def _build_merged(
     merged_file = output_root / MERGE_FILE_NAME
     models.append_task_log(task_id, f"[合并] 开始拼接 {len(parts)} 个片段 → {merged_file}")
 
+    # 合并阶段的 ffmpeg 同样登记进程：取消时可立即强杀并清理半成品
+    proc_callbacks = {
+        "on_spawn": lambda proc: register_proc(task_id, proc),
+        "on_release": lambda proc: release_proc(task_id, proc),
+        "is_canceled": lambda: is_task_canceled(task_id),
+    }
+
     if output_cfg.get("mergeWithFirst") and len(parts) > 1:
         # 片头是原始视频，编码参数与合成结果不同，直接 copy 拼接会失败，故重新编码；
         # 同时按页面配置的分辨率/码率统一重编码，避免成片被片头的原始分辨率带偏
@@ -263,11 +532,14 @@ def _build_merged(
             width=output_cfg.get("width"),
             height=output_cfg.get("height"),
             bitrate=output_cfg.get("bitrate"),
+            **proc_callbacks,
         )
     else:
-        result = concat_videos(parts, merged_file)
+        result = concat_videos(parts, merged_file, **proc_callbacks)
 
-    if result.get("success"):
+    if result.get("canceled"):
+        models.append_task_log(task_id, "[合并] 已终止（任务取消），半成品已清理")
+    elif result.get("success"):
         models.append_task_log(task_id, f"[合并] 完成 → {merged_file}")
     else:
         models.append_task_log(task_id, f"[合并] 失败：{result.get('error', '未知错误')}")
@@ -284,6 +556,7 @@ def _write_episode_log(log_file: Path, episode: dict[str, Any], result: dict[str
     try:
         lines = [
             f"分集：第{episode['index']}集 {episode['name']}",
+            f"素材组：{episode.get('groupName') or episode['name']}",
             f"视频：{episode.get('videoPath')}",
             f"配音：{episode.get('audioPath')}",
             f"字幕：{episode.get('subtitlePath') or '（无）'}",
