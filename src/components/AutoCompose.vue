@@ -211,9 +211,38 @@
           <span class="unit-text">px</span>
         </div>
         <div class="row-inline mt8">
-          <span class="field-label">自定义码率</span>
-          <el-input-number v-model="form.bitrate" :min="200" :max="50000" :step="100" controls-position="right" style="width: 160px" />
+          <span class="field-label">编码引擎</span>
+          <el-select v-model="form.engine" style="width: 180px">
+            <el-option label="自动（推荐）" value="auto" />
+            <el-option label="CPU 软编码" value="cpu" />
+            <el-option label="N卡 NVENC" value="nvenc" />
+            <el-option label="Intel QSV" value="qsv" />
+            <el-option label="A卡 AMF" value="amf" />
+          </el-select>
+          <span class="field-label ml16">自定义码率</span>
+          <el-input-number v-model="form.bitrate" :min="200" :max="50000" :step="100" controls-position="right" style="width: 150px" />
           <span class="unit-text">kbps</span>
+        </div>
+        <div class="row-inline mt8">
+          <span class="field-label">编码预设</span>
+          <el-select v-model="form.preset" style="width: 150px">
+            <el-option label="slow（最慢/画质最好）" value="slow" />
+            <el-option label="medium" value="medium" />
+            <el-option label="fast（推荐）" value="fast" />
+            <el-option label="veryfast（最快）" value="veryfast" />
+          </el-select>
+          <span class="field-label ml16">CRF / CQ</span>
+          <el-input-number v-model="form.crf" :min="0" :max="51" controls-position="right" style="width: 130px" />
+          <span class="unit-text">软编码=CRF，硬件编码=CQ；0 = 关闭</span>
+        </div>
+        <div class="hint-text">
+          提示：编码预设越快渲染越快，画质轻微下降；恒定质量数值越小画质越好（常用 18~28）。硬件编码时该值作为 CQ，自动替代软编码 CRF。
+        </div>
+        <div class="hint-text">
+          编码引擎「自动」会探测本机可用硬件编码器：按 N卡 NVENC → Intel QSV → A卡 AMF 优先级选择，均不可用时自动降级为 CPU libx264 软编码；手动指定但本机不可用也会自动降级。
+        </div>
+        <div class="hint-text">
+          注意：硬烧字幕（subtitles 滤镜）无法硬件加速，字幕叠加始终由 CPU 处理；硬件加速仅加速「视频编码」这一步。
         </div>
       </el-card>
 
@@ -222,11 +251,11 @@
         <template #header><span class="panel-title">性能限制</span></template>
         <div class="row-inline">
           <el-checkbox v-model="form.parallelEnabled">启用并行处理</el-checkbox>
-          <span class="field-label ml16">最大任务数</span>
+          <span class="field-label ml16">最大任务数（线程池并发）</span>
           <el-input-number
             v-model="form.maxWorkers"
             :min="1"
-            :max="16"
+            :max="32"
             :disabled="!form.parallelEnabled"
             controls-position="right"
             style="width: 130px"
@@ -237,8 +266,22 @@
           <el-slider v-model="form.perfLimit" :min="0" :max="100" style="flex: 1; max-width: 420px" />
           <span class="value-text">{{ form.perfLimit }}%</span>
         </div>
+        <div class="row-inline mt8">
+          <span class="field-label">时长统计</span>
+          <span class="value-text">FFmpeg 渲染总时长：<b>{{ durationStats.renderText }}</b></span>
+          <span class="value-text ml16">排队等待总时长：<b>{{ durationStats.queueText }}</b></span>
+        </div>
         <div class="hint-text">
-          提示：并行处理可提升合成速度，但会显著增加 CPU / 内存占用；性能上限用于限制整体资源占用，请根据本机配置调整。
+          提示：并发过高会导致 CPU / 磁盘 IO 打满，反而拖慢整体渲染速度，建议取 CPU 核心数的一半左右。
+        </div>
+        <div class="hint-text">
+          两层并发互不冲突：Python 线程池「最大任务数」控制同时并行运行的 FFmpeg 进程数；FFmpeg 内部 -threads 控制单个视频编码的内部多线程。
+        </div>
+        <div class="hint-text">
+          建议源素材目录和输出目录放置在 SSD；机械硬盘并发渲染容易触发 IO 瓶颈，渲染速度会明显下降。
+        </div>
+        <div class="hint-text">
+          时长口径：进度统计只使用「FFmpeg 渲染总时长」，「排队等待总时长」不计入渲染耗时，避免误判视频编码速度。
         </div>
       </el-card>
 
@@ -353,6 +396,10 @@ import { api } from '@/api'
 const fontOptions = ['微软雅黑', '黑体', '宋体', '楷体', '思源黑体', 'Arial']
 
 // ---------- 页面表单：字段名与后端预设/任务结构保持一致 ----------
+// 线程池最大并发任务数默认取 CPU 核心数的一半（并发过高会打满 CPU/磁盘 IO 反而拖慢速度）
+const CPU_CORES = navigator.hardwareConcurrency || 4
+const DEFAULT_MAX_WORKERS = Math.max(1, Math.floor(CPU_CORES / 2))
+
 const form = reactive({
   // 处理来源
   sourceDir: '',
@@ -377,9 +424,12 @@ const form = reactive({
   width: 1280,
   height: 720,
   bitrate: 2000,
+  preset: 'fast',   // h.264 编码预设
+  crf: 0,           // 软编码=CRF / 硬件编码=CQ；>0 时以恒定质量编码
+  engine: 'auto',   // 编码引擎：auto / cpu / nvenc / qsv / amf
   // 性能限制
   parallelEnabled: true,
-  maxWorkers: 4,
+  maxWorkers: DEFAULT_MAX_WORKERS,
   perfLimit: 80
 })
 
@@ -413,6 +463,10 @@ const composeStage = ref('ready')
 // 数值以后端任务状态接口返回的 elapsedSeconds 为准；任务结束（终态）后计时停止
 const elapsedSeconds = ref(0)
 const elapsedText = computed(() => formatDuration(elapsedSeconds.value))
+
+// ---------- 双时长统计（性能限制卡片展示）----------
+// renderText = FFmpeg 实际渲染总时长（进度统计只用它）；queueText = 排队等待总时长（不计入渲染耗时）
+const durationStats = ref({ renderText: '00:00:00', queueText: '00:00:00' })
 
 // ---------- 任务结束弹窗（全部成功 / 存在失败项，仅【确定】关闭） ----------
 const completionDialog = ref(false)
@@ -637,6 +691,7 @@ async function handleBrowseSource() {
     composeStage.value = 'ready'
     // 目录变更：计时归零，允许新任务结束弹窗
     elapsedSeconds.value = 0
+    durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
     completionDialog.value = false
     completionNotifiedId.value = null
   }
@@ -672,6 +727,7 @@ async function handleScan() {
     // 扫描完成且尚未开始渲染 → 准备就绪；计时归零，允许下次任务结束弹窗
     composeStage.value = 'ready'
     elapsedSeconds.value = 0
+    durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
     completionDialog.value = false
     completionNotifiedId.value = null
     scanStatus.value = `扫描完成：共 ${res?.total ?? episodes.value.length} 集`
@@ -724,7 +780,10 @@ function buildPayload() {
       mergeWithFirst: form.mergeWithFirst,
       width: form.width,
       height: form.height,
-      bitrate: form.bitrate
+      bitrate: form.bitrate,
+      preset: form.preset,
+      crf: form.crf,
+      engine: form.engine
     },
     performance: {
       parallelEnabled: form.parallelEnabled,
@@ -762,6 +821,7 @@ async function handleStartCompose() {
     groupProgress.value = { done: 0, total: groupProgress.value.total }
     // 计时起点 = 后端记录的任务起始时间戳；新任务允许再次弹窗
     elapsedSeconds.value = res?.elapsedSeconds ?? 0
+    durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
     completionNotifiedId.value = null
     startPolling()
   } catch (e) {
@@ -791,10 +851,10 @@ async function handleCancelTask() {
   }
 }
 
-// 轮询任务进度（阶段8 联调）
+// 轮询任务进度（阶段8 联调）：800ms 间隔，降低高频请求开销且不影响进度观感
 function startPolling() {
   stopPolling()
-  pollTimer = setInterval(refreshTask, 1000)
+  pollTimer = setInterval(refreshTask, 800)
 }
 
 function stopPolling() {
@@ -815,6 +875,11 @@ async function refreshTask() {
     groupProgress.value = { done: res.doneGroups ?? 0, total: res.totalGroups ?? 0 }
     // 已运行时长：以后端起始时间戳推导的秒数为准，随轮询实时刷新
     elapsedSeconds.value = res.elapsedSeconds ?? elapsedSeconds.value
+    // 双时长：FFmpeg 实际渲染总时长（进度统计口径）/ 排队等待总时长
+    durationStats.value = {
+      renderText: res.renderText || '00:00:00',
+      queueText: res.queueText || '00:00:00'
+    }
     applyEpisodeProgress(res.episodes)
     if (res.status === 'canceled') {
       // 手动取消：计时在取消时刻停止，进度不再更新，且不弹完成弹窗

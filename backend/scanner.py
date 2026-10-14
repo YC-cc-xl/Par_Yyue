@@ -15,6 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ffmpeg_render import probe_sources
+
 # 识别用的扩展名（统一小写比较）
 VIDEO_EXTS = (".mp4",)
 AUDIO_EXTS = (".mp3",)
@@ -185,5 +187,19 @@ def scan_episodes(root_dir: str | Path) -> dict[str, Any]:
                 "missing": [] if first else ["视频", "配音"],
             }
         )
+
+    # 扫描阶段一次性预解析全部源素材（分辨率/编码/采样率/通道）写入内存缓存，
+    # 后续构建 ffmpeg 命令直接读缓存，避免每个 ffmpeg 子进程重复探测源文件
+    sources = [
+        path
+        for episode in episodes
+        for group in episode["groups"]
+        for path in (group.get("videoPath"), group.get("audioPath"))
+        if path
+    ]
+    try:
+        probe_sources(sources)
+    except Exception:  # 探测失败不影响扫描结果，仅失去缓存加速
+        pass
 
     return {"root": str(root), "total": len(episodes), "episodes": episodes}

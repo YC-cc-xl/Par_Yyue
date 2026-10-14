@@ -93,6 +93,9 @@ class OutputConfig(BaseModel):
     width: int = 1280
     height: int = 720
     bitrate: int = 2000
+    preset: str = "fast"      # h.264 编码预设：slow / medium / fast / veryfast
+    crf: int = 0              # >0 时使用恒定质量 CRF，否则用 bitrate 目标码率
+    engine: str = "auto"      # 编码引擎：auto / cpu / nvenc / qsv / amf（不可用自动降级 CPU）
 
 
 class PerformanceConfig(BaseModel):
@@ -315,6 +318,11 @@ def tasks_progress(task_id: int) -> dict:
             "totalGroups": runtime["totalGroups"],
             "doneGroups": runtime["doneGroups"],
             "episodes": runtime["episodes"],
+            # 全局双时长：仅用于新增的性能/并发面板展示，不影响原统计栏
+            "renderSeconds": runtime.get("renderSeconds", 0),
+            "renderText": runtime.get("renderText") or "00:00:00",
+            "queueSeconds": runtime.get("queueSeconds", 0),
+            "queueText": runtime.get("queueText") or "00:00:00",
         }
     )
 

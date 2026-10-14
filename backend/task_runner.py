@@ -27,6 +27,8 @@ from ffmpeg_render import (
     concat_videos,
     locate_ffmpeg,
     terminate_process,
+    resolve_encoder,
+    ENGINE_LABELS,
     FfmpegNotFound,
 )
 from scanner import scan_episodes, OUTPUT_DIR_NAME
@@ -133,12 +135,22 @@ def get_task_progress(task_id: int) -> dict[str, Any] | None:
         state = _RUN_STATE.get(task_id)
         if state is None:
             return None
+        episodes = sorted(state["episodes"].values(), key=lambda ep: ep["index"])
+        # 全局双时长：渲染总时长取各分集累加（前端进度统计只使用它，排队不计入）
+        render_total = sum(float(ep.get("renderSeconds") or 0.0) for ep in episodes)
+        queue_total = sum(float(ep.get("queueSeconds") or 0.0) for ep in episodes)
         return {
             "totalGroups": state["totalGroups"],
             "doneGroups": state["doneGroups"],
             "success": state["success"],
             "failed": state["failed"],
-            # 分集条目：追加本集渲染耗时（duration 秒 / durationText 时:分:秒）
+            # 全局：FFmpeg 实际渲染总时长 / 排队等待总时长（均附带 h:m:s 文本）
+            "renderSeconds": round(render_total, 3),
+            "renderText": _format_duration(render_total),
+            "queueSeconds": round(queue_total, 3),
+            "queueText": _format_duration(queue_total),
+            # 分集条目：duration/durationText 仅表示本集 FFmpeg 实际渲染耗时，
+            # queueText 为排队等待时长；分集表格既有字段（done/success/failed/status）保持不变
             "episodes": [
                 {
                     "index": ep["index"],
@@ -150,8 +162,9 @@ def get_task_progress(task_id: int) -> dict[str, Any] | None:
                     "status": ep["status"],
                     "duration": ep.get("duration"),
                     "durationText": ep.get("durationText") or "",
+                    "queueText": ep.get("queueText") or "",
                 }
-                for ep in sorted(state["episodes"].values(), key=lambda ep: ep["index"])
+                for ep in episodes
             ],
         }
 
@@ -183,15 +196,19 @@ def _cpu_count() -> int:
 
 
 def _resolve_workers(config: dict[str, Any]) -> int:
-    """线程池并发数：启用并行处理时取最大任务数，否则串行（1）"""
+    """线程池并发数：启用并行处理时取最大任务数，否则串行（1）
+
+    默认值 = CPU 核心数的一半（并发过高会导致 CPU/磁盘 IO 打满，反而拖慢整体速度）。
+    """
     performance = config.get("performance") or {}
     if not performance.get("parallelEnabled", True):
         return 1
+    default_workers = max(1, _cpu_count() // 2)
     try:
-        workers = int(performance.get("maxWorkers") or 4)
+        workers = int(performance.get("maxWorkers") or default_workers)
     except (TypeError, ValueError):
-        workers = 4
-    return max(1, min(workers, 16))
+        workers = default_workers
+    return max(1, min(workers, 32))
 
 
 def _resolve_threads(config: dict[str, Any]) -> int:
@@ -292,11 +309,12 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                 "success": 0,
                 "failed": 0,
                 "status": "pending",
-                # 分集渲染耗时：startTs/endTs 取该集所有组中最早的开始与最晚的结束
-                "startTs": None,
-                "endTs": None,
+                # 双时长：queueSeconds=入队→ffmpeg 真正启动的排队等待；renderSeconds=ffmpeg 实际编码耗时
+                "queueSeconds": 0.0,
+                "renderSeconds": 0.0,
                 "duration": None,
                 "durationText": "",
+                "queueText": "",
             }
             for episode in episodes
         },
@@ -316,10 +334,18 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
         f"[任务] 共 {len(episodes)} 集，有效素材 {len(jobs)} 组，并发数 {workers}，"
         f"每进程编码线程 {threads}",
     )
+    # 编码引擎：页面选 auto 时按 NVENC > QSV > AMF 优先级自动挑选可用硬件编码器，
+    # 不可用则降级 CPU 软编码；这里解析一次并写入日志（字幕硬烧仍由 CPU 完成）
+    engine_key, engine_codec = resolve_encoder(output_cfg, ffmpeg_path)
     models.append_task_log(
         task_id,
         f"[任务] 分辨率 {output_cfg.get('width', 1280)}×{output_cfg.get('height', 720)}，"
-        f"码率 {output_cfg.get('bitrate', 2000)}kbps，输出目录：{output_root}",
+        f"码率 {output_cfg.get('bitrate', 2000)}kbps，编码预设 {output_cfg.get('preset') or 'fast'}，"
+        f"CRF/CQ {(output_cfg.get('crf') or 0) or '未启用'}，"
+        f"编码引擎 {ENGINE_LABELS.get(str(output_cfg.get('engine') or 'auto').lower(), '自动')}"
+        f" → {ENGINE_LABELS.get(engine_key, engine_key)}（{engine_codec}）"
+        f"{'，字幕硬烧由 CPU 完成' if (config.get('subtitle') or {}).get('enabled') else ''}，"
+        f"输出目录：{output_root}",
     )
 
     # 被跳过的素材逐条提示，明确告知缺少哪个文件（不统计、不渲染）
@@ -344,12 +370,24 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
         return
 
     def render_one(job: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Path, float, float]:
-        """渲染单组素材（在线程池中执行），并记录该组的起止时间戳"""
+        """渲染单组素材（在线程池中执行）
+
+        返回 (job, result, out_file, queue_seconds, render_seconds)：
+          - queue_seconds：任务入队 → ffmpeg 进程真正启动之间的排队等待
+          - render_seconds：ffmpeg 启动 → 渲染结束的实际编码耗时（不含排队）
+        """
         episode_dir = output_root / job["name"]
         episode_dir.mkdir(parents=True, exist_ok=True)
         out_file = episode_dir / f"{job['groupName']}.mp4"
 
-        started = time.monotonic()
+        enqueue_ts = job.get("enqueueTs") or time.monotonic()
+        spawn_holder: dict[str, float] = {}
+
+        def _on_spawn(proc: subprocess.Popen) -> None:
+            # ffmpeg 真正启动的瞬间 = 渲染计时起点（与入队时刻之差即排队等待）
+            spawn_holder["ts"] = time.monotonic()
+            register_proc(task_id, proc)
+
         result = render_episode(
             job,
             out_file,
@@ -357,22 +395,32 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
             work_sub_name=f"sub_{task_id}_{job['index']:03d}_{job['groupName']}.ass",
             threads=threads,
             # 交出 ffmpeg 句柄：取消时可立即强杀；is_canceled 用于区分「被强杀」与真实失败
-            on_spawn=lambda proc: register_proc(task_id, proc),
+            on_spawn=_on_spawn,
             on_release=lambda proc: release_proc(task_id, proc),
             is_canceled=lambda: state["canceled"],
         )
         ended = time.monotonic()
+        spawn_ts = spawn_holder.get("ts", ended)
         _write_episode_log(log_dir / f"{job['name']}__{job['groupName']}.log", job, result)
-        return job, result, out_file, started, ended
+        return (
+            job,
+            result,
+            out_file,
+            max(0.0, spawn_ts - enqueue_ts),   # 排队等待时长
+            max(0.0, ended - spawn_ts),        # FFmpeg 实际渲染时长
+        )
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="render") as pool:
-        futures = {pool.submit(render_one, job): job for job in jobs}
+        futures: dict[Any, dict[str, Any]] = {}
+        for job in jobs:
+            job["enqueueTs"] = time.monotonic()   # 入队时刻（统计排队等待时长用）
+            futures[pool.submit(render_one, job)] = job
         for future in as_completed(futures):
             job = futures[future]
             label = f"[第{job['index']}集 {job['name']} · {job['groupName']}]"
-            started = ended = None
+            queue_seconds = render_seconds = None
             try:
-                job, result, out_file, started, ended = future.result()
+                job, result, out_file, queue_seconds, render_seconds = future.result()
             except Exception as exc:  # 单组异常不影响其它素材组
                 job, result, out_file = job, {"success": False, "error": f"渲染线程异常：{exc}"}, None
 
@@ -380,33 +428,40 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                 episode_state = state["episodes"][job["index"]]
 
                 if result.get("canceled"):
-                    # 被取消强杀：不计入 failed、不推进进度，仅记录终止日志
-                    models.append_task_log(task_id, f"{label} 已终止（任务取消）")
+                    # 被取消强杀：不计入 failed、不推进进度，仅记录终止日志（含两套时长）
+                    models.append_task_log(
+                        task_id,
+                        f"{label} 已终止（任务取消）｜排队 {_format_duration(queue_seconds or 0.0)}，"
+                        f"已渲染 {_format_duration(render_seconds or 0.0)}",
+                    )
                 else:
                     episode_state["done"] += 1
 
-                    # 分集渲染耗时：取该集所有组中最早的开始、最晚的结束
-                    if started is not None and (
-                        episode_state["startTs"] is None or started < episode_state["startTs"]
-                    ):
-                        episode_state["startTs"] = started
-                    if ended is not None and (
-                        episode_state["endTs"] is None or ended > episode_state["endTs"]
-                    ):
-                        episode_state["endTs"] = ended
+                    # 双时长累加：排队等待 与 FFmpeg 实际渲染 分别统计
+                    episode_state["queueSeconds"] += max(0.0, queue_seconds or 0.0)
+                    episode_state["renderSeconds"] += max(0.0, render_seconds or 0.0)
 
                     if result.get("success"):
                         state["success"] += 1
                         episode_state["success"] += 1
                         if out_file is not None:
                             outputs.setdefault(job["index"], []).append((job["groupName"], out_file))
-                        models.append_task_log(task_id, f"{label} 成功 → {out_file}")
+                        models.append_task_log(
+                            task_id,
+                            f"{label} 成功 → {out_file}｜排队 {_format_duration(queue_seconds or 0.0)}，"
+                            f"渲染 {_format_duration(render_seconds or 0.0)}",
+                        )
                         for warning in result.get("warnings") or []:
                             models.append_task_log(task_id, f"{label} 警告：{warning}")
                     else:
                         state["failed"] += 1
                         episode_state["failed"] += 1
-                        models.append_task_log(task_id, f"{label} 失败：{result.get('error', '未知错误')}")
+                        models.append_task_log(
+                            task_id,
+                            f"{label} 失败：{result.get('error', '未知错误')}｜排队 "
+                            f"{_format_duration(queue_seconds or 0.0)}，"
+                            f"渲染 {_format_duration(render_seconds or 0.0)}",
+                        )
                         for line in _tail_lines(result.get("log") or "", LOG_TAIL_LINES):
                             models.append_task_log(task_id, f"{label} | {line}")
 
@@ -419,20 +474,23 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                     else:
                         episode_state["status"] = "running"
 
-                    # 该集所有组都已返回 → 结算本集渲染耗时并写入日志（存入任务数据）
+                    # 该集所有组都已返回 → 结算本集双时长并写入日志（存入任务数据）
                     if (
                         episode_state["total"]
                         and episode_state["done"] >= episode_state["total"]
                         and not episode_state["durationText"]
                     ):
-                        duration = max(
-                            0.0, (episode_state["endTs"] or 0.0) - (episode_state["startTs"] or 0.0)
-                        )
-                        episode_state["duration"] = round(duration, 3)
-                        episode_state["durationText"] = _format_duration(duration)
+                        render_total = episode_state["renderSeconds"]
+                        queue_total = episode_state["queueSeconds"]
+                        # duration/durationText 仅表示 FFmpeg 实际渲染时长（排队不计入）
+                        episode_state["duration"] = round(render_total, 3)
+                        episode_state["durationText"] = _format_duration(render_total)
+                        episode_state["queueText"] = _format_duration(queue_total)
                         models.append_task_log(
                             task_id,
-                            f"[第{job['index']}集 {job['name']}] 本集渲染完成，耗时 {episode_state['durationText']}",
+                            f"[第{job['index']}集 {job['name']}] 本集渲染完成，"
+                            f"FFmpeg 渲染耗时 {episode_state['durationText']}，"
+                            f"排队等待 {episode_state['queueText']}",
                         )
 
                     models.update_task(
@@ -455,13 +513,18 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
         _build_merged(task_id, config, output_root, outputs, episodes)
 
     # ---- 5. 收敛任务状态 ----
+    # 全局双时长：FFmpeg 实际渲染总时长（排队不计入）/ 排队等待总时长
+    render_total = sum(float(ep.get("renderSeconds") or 0.0) for ep in state["episodes"].values())
+    queue_total = sum(float(ep.get("queueSeconds") or 0.0) for ep in state["episodes"].values())
     if state["canceled"]:
         # 取消：不把进度推到 100%，进度条保持停止更新；最终状态 canceled（终态）
         models.update_task(task_id, status="canceled")
         models.append_task_log(
             task_id,
             f"[取消] 任务已取消，成功 {state['success']} 组，失败 {state['failed']} 组，"
-            f"已完成 {state['doneGroups']} / {state['totalGroups']} 组素材",
+            f"已完成 {state['doneGroups']} / {state['totalGroups']} 组素材"
+            f"｜FFmpeg 渲染总耗时 {_format_duration(render_total)}，"
+            f"排队等待总时长 {_format_duration(queue_total)}",
         )
         return
 
@@ -471,7 +534,9 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
     models.append_task_log(
         task_id,
         f"[完成] 成功 {state['success']} 组，失败 {state['failed']} 组，"
-        f"共 {len(episodes)} 集 / {state['totalGroups']} 组素材",
+        f"共 {len(episodes)} 集 / {state['totalGroups']} 组素材"
+        f"｜FFmpeg 渲染总耗时 {_format_duration(render_total)}，"
+        f"排队等待总时长 {_format_duration(queue_total)}",
     )
 
 
@@ -532,6 +597,9 @@ def _build_merged(
             width=output_cfg.get("width"),
             height=output_cfg.get("height"),
             bitrate=output_cfg.get("bitrate"),
+            preset=output_cfg.get("preset"),
+            crf=output_cfg.get("crf"),
+            engine=output_cfg.get("engine"),
             **proc_callbacks,
         )
     else:
