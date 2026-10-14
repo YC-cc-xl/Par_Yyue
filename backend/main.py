@@ -30,6 +30,12 @@ from pydantic import BaseModel, Field
 import models
 from scanner import scan_episodes
 
+# 系统资源监控（零依赖 ctypes 实现）；不可用时接口返回「不支持」，不影响渲染流程
+try:
+    import system_monitor
+except ImportError:  # pragma: no cover
+    system_monitor = None
+
 # 阶段6 提供的并发渲染入口；未就绪时给出明确提示而不是崩溃
 try:
     from task_runner import start_task_async, get_task_progress, request_cancel, get_cancel_at
@@ -44,8 +50,10 @@ DEFAULT_PORT = 8123
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """启动时建表（幂等）"""
+    """启动时建表（幂等）并启动系统资源采样线程（供页面资源监控面板读取）"""
     models.init_db()
+    if system_monitor is not None:
+        system_monitor.start()
     yield
 
 
@@ -85,6 +93,10 @@ class BgmConfig(BaseModel):
 class SubtitleConfig(BaseModel):
     enabled: bool = False
     style: dict = Field(default_factory=dict)
+    # 字体绝对路径（可选）：字体会被 libass 直接定位，省掉逐个字体目录查找的耗时，
+    # 也避免「字体缺失 → 回退别的字体」造成的字幕渲染异常
+    fontFile: str = ""    # 字体文件绝对路径（如 C:\Windows\Fonts\msyh.ttc）
+    fontsDir: str = ""    # 字体所在目录（提供 fontFile 时可留空，自动取其所在目录）
 
 
 class OutputConfig(BaseModel):
@@ -102,6 +114,12 @@ class PerformanceConfig(BaseModel):
     parallelEnabled: bool = True
     maxWorkers: int = 4
     perfLimit: int = 80
+    # 进程防护：单集/拼接的 ffmpeg 执行超时（秒，0=用默认 21600）与单进程内存上限（MB，0=不限）
+    taskTimeoutSec: int = 21600
+    memoryLimitMB: int = 0
+    # 系统资源保护阈值：CPU 持续高于该值 / 磁盘吞吐高于该值 → 暂停提交新任务（0=不启用该判据）
+    cpuThreshold: int = 90
+    ioThresholdMBps: float = 0.0
 
 
 class TaskRequest(BaseModel):
@@ -164,6 +182,29 @@ def _with_runtime(task):
 def health() -> dict:
     """健康检查：Electron 启动后端后轮询此接口判断是否就绪"""
     return {"status": "ok", "db": str(models.DB_PATH)}
+
+
+@app.get("/api/system/resources")
+def system_resources() -> dict:
+    """实时系统资源快照（页面资源监控面板每 2 秒轮询）
+
+    返回 CPU 占用率、磁盘读写吞吐、是否处于饱和（饱和时后台会临时暂停提交新任务）。
+    监控模块不可用时返回「不支持」占位，前端做降级展示。
+    """
+    if system_monitor is None:
+        return {
+            "supported": False,
+            "cpuPercent": 0.0,
+            "diskReadMBps": 0.0,
+            "diskWriteMBps": 0.0,
+            "processCount": 0,
+            "cpuThreshold": 0.0,
+            "ioThresholdMBps": 0.0,
+            "cpuHigh": False,
+            "ioHigh": False,
+            "throttled": False,
+        }
+    return system_monitor.snapshot()
 
 
 @app.post("/api/compose/scan")

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -500,6 +501,31 @@ def _work_dir() -> Path:
     return directory
 
 
+_FONT_LOCK = threading.Lock()
+
+
+def _materialize_font(font_file: str) -> Optional[Path]:
+    """把指定字体文件复制到「私有字体目录」，返回该目录（失败返回 None）
+
+    只让 libass 看到这一个字体，既省掉遍历系统字体目录的查找耗时，
+    也避免某些系统字体目录（内含 .fon 位图字体）导致 libass 加载崩溃。
+    同名同大小的字体只复制一次（按任务复用）。
+    """
+    src = Path(font_file)
+    if not src.is_file():
+        return None
+    cache_dir = _work_dir() / "fonts_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dst = cache_dir / src.name
+    with _FONT_LOCK:
+        try:
+            if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+                shutil.copy2(src, dst)
+        except OSError:
+            return None
+    return cache_dir
+
+
 def _resolve_preset(output: dict[str, Any]) -> str:
     """读取编码预设，非法/缺省值回落到默认 fast"""
     preset = str(output.get("preset") or DEFAULT_PRESET).strip().lower()
@@ -575,28 +601,45 @@ def build_render_command(
     bgm_enabled = bool(bgm.get("enabled")) and bool(bgm.get("file"))
     subtitle_on = bool(subtitle.get("enabled")) and ass_file is not None
 
+    # ---- 字幕字体绝对路径 ----
+    # 指定字体目录/字体文件后，libass 直接定位字体，省掉遍历系统字体目录的查找耗时，
+    # 也避免「字体缺失 → 回退到别的字体」导致的字幕渲染异常。
+    # 只给了字体文件时，把该字体复制到「私有字体目录」再交给 libass：
+    # 只加载这一个字体，避免扫描整个系统字体目录（含 .fon 位图字体时 libass 可能崩溃）。
+    subtitle_font_args = ""
+    fonts_dir = str(subtitle.get("fontsDir") or "").strip()
+    font_file = str(subtitle.get("fontFile") or "").strip()
+    if fonts_dir:
+        subtitle_font_args = f":fontsdir='{_escape_filter_path(Path(fonts_dir))}'"
+    elif font_file:
+        cache_dir = _materialize_font(font_file)
+        if cache_dir is not None:
+            subtitle_font_args = f":fontsdir='{_escape_filter_path(cache_dir)}'"
+
     # ---- 视频链 ----
-    # 直接读扫描阶段写入的预解析缓存：源分辨率已等于目标时跳过 scale/pad（省掉一道高开销缩放），
-    # 否则按目标分辨率缩放（保持比例 + 黑边补齐）；两种情况都不插入多余 format / colorspace 转换。
+    # 关键顺序：先缩放分辨率、再叠加字幕 —— 字幕滤镜只需处理缩放后的像素，
+    # 相比「先字幕后缩放」大幅降低 CPU 开销；整条视频链连续拼接（不插入中间标签），
+    # 且不使用任何 format/colorspace 转换，减少帧缓冲区拷贝。
+    # 直接读扫描阶段写入的预解析缓存：源分辨率已等于目标时跳过 scale/pad 这道高开销缩放。
     media = probe_media(video_path)
     same_size = media.get("width") == width and media.get("height") == height
     if same_size:
-        filters: list[str] = ["[0:v]setsar=1[vbase]"]
+        video_chain = "[0:v]setsar=1"
     else:
-        filters = [
+        video_chain = (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[vbase]"
-        ]
-    if subtitle_on:
-        # 硬烧字幕：指定 original_size（免去 libass 二次缩放）并关闭复杂字形重排（shaping=simple），
-        # 降低字幕烧制的 CPU 开销
-        filters.append(
-            f"[vbase]subtitles=filename='{_escape_filter_path(ass_file)}'"
-            f":original_size={width}x{height}:shaping=simple[vout]"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
         )
-        video_map = "[vout]"
-    else:
-        video_map = "[vbase]"
+    if subtitle_on:
+        # 硬烧字幕：ASS 渲染（srt 已在渲染前预转为 ass）；指定 original_size 免去 libass 二次缩放，
+        # shaping=simple 关闭复杂字形重排，降低字幕烧制 CPU 开销
+        video_chain += (
+            f",subtitles=filename='{_escape_filter_path(ass_file)}'"
+            f":original_size={width}x{height}:shaping=simple{subtitle_font_args}"
+        )
+    video_chain += "[vout]"
+    filters: list[str] = [video_chain]
+    video_map = "[vout]"
 
     # ---- 音频链：配音（不足补静音） + BGM（无限循环、降音量）----
     # 链首统一固定采样率/声道（AUDIO_FORMAT），避免混音时反复动态重采样
@@ -699,16 +742,119 @@ def terminate_process(proc: subprocess.Popen) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# 单进程内存上限（Windows Job Object）
+#   给每个 ffmpeg 子进程套一个 Job Object 并设置「进程内存上限」，
+#   超限时该进程的分配会失败而不是拖垮整机；非 Windows / 设置失败时一次性
+#   记录 WARN 并降级（不影响渲染）。
+# ---------------------------------------------------------------------------
+
+_JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+
+_mem_limit_warned = threading.Event()
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryLimit", ctypes.c_size_t),
+        ("PeakJobMemoryLimit", ctypes.c_size_t),
+    ]
+
+
+def _apply_memory_limit(proc: subprocess.Popen, limit_mb: int) -> bool:
+    """给单个 ffmpeg 子进程设置内存上限（Windows Job Object）
+
+    成功返回 True；非 Windows、limit<=0 或设置失败返回 False（调用方降级处理）。
+    Job 句柄在分配后立即关闭：只要进程仍与 Job 关联，Job 就继续存在并保持内存上限。
+    """
+    if os.name != "nt" or limit_mb <= 0:
+        return False
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.SetInformationJobObject.restype = ctypes.c_bool
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32
+        ]
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_bool
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return False
+        try:
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            info.ProcessMemoryLimit = int(limit_mb) * 1024 * 1024
+            if not kernel32.SetInformationJobObject(
+                job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(info), ctypes.sizeof(info),
+            ):
+                return False
+            handle = kernel32.OpenProcess(
+                _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, proc.pid
+            )
+            if not handle:
+                return False
+            try:
+                return bool(kernel32.AssignProcessToJobObject(job, handle))
+            finally:
+                kernel32.CloseHandle(handle)
+        finally:
+            kernel32.CloseHandle(job)
+    except (OSError, AttributeError):
+        return False
+
+
 def run_ffmpeg(
     command: list[str],
     on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
     on_release: Optional[Callable[[subprocess.Popen], None]] = None,
     is_canceled: Optional[Callable[[], bool]] = None,
     timeout: int = RENDER_TIMEOUT,
+    memory_limit_mb: int = 0,
 ) -> tuple[str, str, Optional[int], Optional[str]]:
     """执行 ffmpeg，返回 (stdout, stderr, returncode, 执行异常标记)
 
     异常标记：None=正常结束 / "timeout"=超时被终止 / "canceled"=任务取消被强杀
+    timeout: 单次执行超时（秒），超时自动强杀 ffmpeg，防止卡死进程长期占用资源
+    memory_limit_mb: 单进程内存上限（MB，0=不限制；Windows 用 Job Object 实现，失败降级）
     """
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -728,10 +874,18 @@ def run_ffmpeg(
         **kwargs,
     )
     registered = False
+    mem_warning = ""
     try:
         if on_spawn is not None:
             on_spawn(proc)      # 交出句柄；若已取消，调用方会立刻杀它
             registered = True
+        # 进程内存上限：失败仅记录一次 WARN（写入日志文本），不中断渲染
+        if memory_limit_mb > 0 and not _apply_memory_limit(proc, memory_limit_mb):
+            if not _mem_limit_warned.is_set():
+                _mem_limit_warned.set()
+                mem_warning = (
+                    f"[memlimit] 未能限制 ffmpeg 进程内存上限（{memory_limit_mb}MB），已忽略，不影响渲染"
+                )
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -740,14 +894,22 @@ def run_ffmpeg(
                 out, err = proc.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 out, err = "", ""
-            return out or "", err or "", proc.returncode, "timeout"
+            return (out or ""), _append_note(err, mem_warning), proc.returncode, "timeout"
     finally:
         if registered and on_release is not None:
             on_release(proc)
 
+    err = _append_note(err, mem_warning)
     if is_canceled is not None and is_canceled():
         return out or "", err or "", proc.returncode, "canceled"
     return out or "", err or "", proc.returncode, None
+
+
+def _append_note(text: Optional[str], note: str) -> str:
+    """在日志文本末尾追加一行提示（note 为空时原样返回）"""
+    if not note:
+        return text or ""
+    return f"{text or ''}\n{note}".strip("\n")
 
 
 def render_episode(
@@ -756,6 +918,8 @@ def render_episode(
     config: dict[str, Any],
     work_sub_name: str = "sub.ass",
     threads: Optional[int] = None,
+    timeout: Optional[int] = None,
+    memory_limit_mb: int = 0,
     on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
     on_release: Optional[Callable[[subprocess.Popen], None]] = None,
     is_canceled: Optional[Callable[[], bool]] = None,
@@ -766,6 +930,8 @@ def render_episode(
     out_file: 输出视频路径
     config:   任务参数（bgm / subtitle / output）
     threads:  单个 ffmpeg 进程的编码线程数（页面「性能上限」）
+    timeout:  单集渲染超时（秒），None/<=0 时取默认 RENDER_TIMEOUT
+    memory_limit_mb: 单进程内存上限（MB，0=不限制）
     on_spawn / on_release / is_canceled: 进程句柄交出与取消判定（支持立即强杀）
     返回: {"success", "output", "error", "log", "command"}；被强杀时附加 canceled=True
     """
@@ -773,6 +939,8 @@ def render_episode(
         ffmpeg = require_ffmpeg()
     except FfmpegNotFound as exc:
         return _fail(out_file, str(exc))
+
+    render_timeout = int(timeout) if timeout and int(timeout) > 0 else RENDER_TIMEOUT
 
     video_path = Path(episode.get("videoPath") or "")
     audio_path = Path(episode.get("audioPath") or "")
@@ -790,15 +958,21 @@ def render_episode(
     width = _even(int(output_cfg.get("width") or 1280))
     height = _even(int(output_cfg.get("height") or 720))
 
-    # ---- 字幕预处理：SRT → ASS，写入临时目录（简单 ASCII 文件名）----
+    # ---- 字幕预处理：优先 ASS 直接渲染；SRT 自动预转 ASS ----
     ass_file: Optional[Path] = None
     if subtitle_cfg.get("enabled"):
         if subtitle_path and subtitle_path.is_file():
+            suffix = subtitle_path.suffix.lower()
             try:
-                srt_text = read_text_any_encoding(subtitle_path)
-                ass_text = srt_to_ass(srt_text, style, width, height)
-                ass_file = _work_dir() / work_sub_name
-                ass_file.write_text(ass_text, encoding="utf-8-sig")
+                if suffix in (".ass", ".ssa"):
+                    # 已是 ASS/SSA：直接复用，跳过 SRT 解析与样式重写（优先 ASS 渲染）
+                    ass_file = subtitle_path
+                else:
+                    # SRT（或其他文本字幕）：预转为带样式的 ASS，写入临时目录（简单 ASCII 文件名）
+                    srt_text = read_text_any_encoding(subtitle_path)
+                    ass_text = srt_to_ass(srt_text, style, width, height)
+                    ass_file = _work_dir() / work_sub_name
+                    ass_file.write_text(ass_text, encoding="utf-8-sig")
             except OSError as exc:
                 return _fail(out_file, f"字幕预处理失败：{exc}")
         else:
@@ -817,7 +991,8 @@ def render_episode(
 
     try:
         stdout, stderr, returncode, exec_error = run_ffmpeg(
-            command, on_spawn=on_spawn, on_release=on_release, is_canceled=is_canceled
+            command, on_spawn=on_spawn, on_release=on_release, is_canceled=is_canceled,
+            timeout=render_timeout, memory_limit_mb=memory_limit_mb,
         )
     except OSError as exc:
         _remove_partial(tmp_file)
@@ -825,7 +1000,7 @@ def render_episode(
 
     if exec_error == "timeout":
         _remove_partial(tmp_file)
-        return _fail(out_file, f"ffmpeg 渲染超时（超过 {RENDER_TIMEOUT} 秒）", command_text)
+        return _fail(out_file, f"ffmpeg 渲染超时（超过 {render_timeout} 秒，已强制终止）", command_text)
     if exec_error == "canceled":
         # 任务取消被强杀：删除半成品，并标注 canceled 供调度层与真实失败区分
         _remove_partial(tmp_file)
@@ -836,6 +1011,9 @@ def render_episode(
 
     ffmpeg_log = stdout + "\n" + stderr
     warnings = _font_warnings(ffmpeg_log)
+    if "[memlimit]" in ffmpeg_log:
+        # 内存上限未生效（Job Object 不可用/被父 Job 限制）：记录为警告，不影响渲染
+        warnings.append("ffmpeg 进程内存上限未能生效（已降级，不影响渲染）")
 
     if returncode != 0:
         # 取日志末尾若干行作为错误摘要，便于页面展示
@@ -916,6 +1094,8 @@ def concat_videos(
     preset: Optional[str] = None,
     crf: Optional[int] = 0,
     engine: Optional[str] = None,
+    timeout: Optional[int] = None,
+    memory_limit_mb: int = 0,
     on_spawn: Optional[Callable[[subprocess.Popen], None]] = None,
     on_release: Optional[Callable[[subprocess.Popen], None]] = None,
     is_canceled: Optional[Callable[[], bool]] = None,
@@ -925,11 +1105,14 @@ def concat_videos(
     parts 均由本模块渲染，编码参数一致，默认 `-c copy` 直接拷贝流（音视频均不重编码，速度最快）。
     reencode=True（拼接对象含编码参数不同的原始视频）时改为重编码，并按传入的
     width/height/bitrate（或 preset/crf/engine）统一编码参数，保证成片与页面配置一致。
+    timeout: 拼接超时（秒），None/<=0 时取默认 RENDER_TIMEOUT
     """
     try:
         ffmpeg = require_ffmpeg()
     except FfmpegNotFound as exc:
         return _fail(out_file, str(exc))
+
+    render_timeout = int(timeout) if timeout and int(timeout) > 0 else RENDER_TIMEOUT
 
     existing = [p for p in parts if p.is_file()]
     if not existing:
@@ -973,7 +1156,8 @@ def concat_videos(
 
     try:
         log_out, log_err, returncode, exec_error = run_ffmpeg(
-            command, on_spawn=on_spawn, on_release=on_release, is_canceled=is_canceled
+            command, on_spawn=on_spawn, on_release=on_release, is_canceled=is_canceled,
+            timeout=render_timeout, memory_limit_mb=memory_limit_mb,
         )
     except OSError as exc:
         _remove_partial(tmp_file)
@@ -981,7 +1165,7 @@ def concat_videos(
 
     if exec_error == "timeout":
         _remove_partial(tmp_file)
-        return _fail(out_file, f"视频拼接超时（超过 {RENDER_TIMEOUT} 秒）")
+        return _fail(out_file, f"视频拼接超时（超过 {render_timeout} 秒，已强制终止）")
     if exec_error == "canceled":
         _remove_partial(tmp_file)
         return {**_fail(out_file, "任务已取消（拼接已终止）"), "canceled": True}

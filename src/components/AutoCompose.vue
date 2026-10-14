@@ -193,7 +193,34 @@
             {{ positionLabel }}
           </span>
         </div>
+        <div class="row-inline mt8">
+          <span class="field-label">字体目录</span>
+          <el-input
+            v-model="form.fontsDir"
+            placeholder="字体目录绝对路径（建议只放需要的字体，勿直接指向系统字体目录）"
+            :disabled="!form.subtitleEnabled"
+            style="flex: 1"
+          />
+        </div>
+        <div class="row-inline mt8">
+          <span class="field-label">字体文件</span>
+          <el-input
+            v-model="form.fontFile"
+            placeholder="字体文件绝对路径（可选，如 D:\fonts\msyh.ttc）"
+            :disabled="!form.subtitleEnabled"
+            style="flex: 1"
+          />
+        </div>
         <div class="hint-text">不勾选「添加字幕」时不烧制字幕，仅做音视频合成。</div>
+        <div class="hint-text">
+          字幕渲染优先使用 ASS：源字幕为 .ass/.ssa 时直接使用，为 .srt 时自动预转为带样式的 ASS 再渲染。
+        </div>
+        <div class="hint-text">
+          配置字体目录后，libass 直接定位字体、省去字体查找耗时，避免「字体缺失 → 回退别的字体」造成的渲染异常；建议指向只放所需字体的专用目录，不要直接指向系统字体目录。仅填「字体文件」时，后端会自动复制该字体到私有字体目录再渲染，只加载这一个字体。
+        </div>
+        <div class="hint-text">
+          默认已配置 <b>C:\Windows\Fonts\msyh.ttc</b>（微软雅黑，Windows 自带）：渲染时只加载这一个字体，既消除字体查找耗时，也避免指向整个系统字体目录导致 libass 加载崩溃。
+        </div>
       </el-card>
 
       <!-- ================= 5. 输出选项 ================= -->
@@ -267,6 +294,26 @@
           <span class="value-text">{{ form.perfLimit }}%</span>
         </div>
         <div class="row-inline mt8">
+          <span class="field-label">任务超时</span>
+          <el-input-number v-model="form.taskTimeoutSec" :min="0" :max="86400" :step="600" controls-position="right" style="width: 150px" />
+          <span class="unit-text">秒（超时自动强杀 ffmpeg；0 = 使用默认 21600）</span>
+        </div>
+        <div class="row-inline mt8">
+          <span class="field-label">内存上限</span>
+          <el-input-number v-model="form.memoryLimitMB" :min="0" :max="65536" :step="256" controls-position="right" style="width: 150px" />
+          <span class="unit-text">MB / 每进程（0 = 不限制）</span>
+        </div>
+        <div class="row-inline mt8">
+          <span class="field-label">CPU 阈值</span>
+          <el-input-number v-model="form.cpuThreshold" :min="0" :max="100" controls-position="right" style="width: 130px" />
+          <span class="unit-text">%（持续高于则暂停提交新任务；0 = 不启用）</span>
+        </div>
+        <div class="row-inline mt8">
+          <span class="field-label">磁盘IO阈值</span>
+          <el-input-number v-model="form.ioThresholdMBps" :min="0" :max="5000" :step="10" controls-position="right" style="width: 150px" />
+          <span class="unit-text">MB/s（高于则暂停提交新任务；0 = 不启用）</span>
+        </div>
+        <div class="row-inline mt8">
           <span class="field-label">时长统计</span>
           <span class="value-text">FFmpeg 渲染总时长：<b>{{ durationStats.renderText }}</b></span>
           <span class="value-text ml16">排队等待总时长：<b>{{ durationStats.queueText }}</b></span>
@@ -285,6 +332,32 @@
         </div>
       </el-card>
 
+      <!-- ================= 7. 系统资源监控（实时轮询） ================= -->
+      <el-card shadow="never" class="panel">
+        <template #header>
+          <span class="panel-title">系统资源监控</span>
+          <el-tag class="ml8" :type="resourceTagType" size="small" effect="plain">{{ resourceStatusLabel }}</el-tag>
+        </template>
+        <div class="row-inline">
+          <span class="field-label">CPU 占用</span>
+          <el-progress
+            :percentage="Math.min(100, Math.round(resourceStats.cpuPercent))"
+            :stroke-width="12"
+            :status="resourceStats.cpuHigh ? 'exception' : undefined"
+            style="width: 220px"
+          />
+          <span class="value-text">{{ resourceStats.cpuPercent }}%</span>
+          <span class="field-label ml16">磁盘读</span>
+          <span class="value-text">{{ resourceStats.diskReadMBps }} MB/s</span>
+          <span class="field-label ml16">磁盘写</span>
+          <span class="value-text">{{ resourceStats.diskWriteMBps }} MB/s</span>
+        </div>
+        <div class="hint-text">
+          资源饱和时（CPU 持续高于阈值 / 磁盘 IO 超过阈值）后台会临时停止提交新任务，等待资源回落再继续入队，避免系统卡死。
+          <template v-if="!resourceStats.supported">（当前系统不支持资源监控，数据不可用）</template>
+        </div>
+      </el-card>
+
       <!-- ================= 任务进度 ================= -->
       <el-card shadow="never" class="panel" v-if="task">
         <template #header>
@@ -297,8 +370,16 @@
           <span class="stat danger">失败组：<b>{{ task.failed }}</b></span>
         </div>
         <el-progress class="mt8" :percentage="task.progress" :status="taskStatus" :stroke-width="14" />
-        <div class="log-title">运行日志</div>
-        <pre class="log-box">{{ task.log || '（暂无日志）' }}</pre>
+        <div class="log-title">
+          <span>运行日志</span>
+          <el-select v-model="logLevel" size="small" style="width: 170px">
+            <el-option label="全部（DEBUG）" value="DEBUG" />
+            <el-option label="信息及以上（INFO）" value="INFO" />
+            <el-option label="仅警告与错误（WARN）" value="WARN" />
+            <el-option label="仅报错（ERROR）" value="ERROR" />
+          </el-select>
+        </div>
+        <pre class="log-box">{{ filteredLog || '（暂无日志）' }}</pre>
       </el-card>
     </div>
 
@@ -418,6 +499,10 @@ const form = reactive({
     outlineWidth: 2,
     position: 'bottom'
   },
+  // 字体绝对路径（实测默认值）：Windows 自带「微软雅黑」msyh.ttc，后端会复制到私有字体目录后
+  // 只加载这一个字体，省掉字体查找耗时并避免字体缺失导致的渲染异常；字体目录留空即为默认策略
+  fontFile: 'C:\\Windows\\Fonts\\msyh.ttc',
+  fontsDir: '',
   // 输出选项
   mergeVideo: true,
   mergeWithFirst: false,
@@ -430,7 +515,12 @@ const form = reactive({
   // 性能限制
   parallelEnabled: true,
   maxWorkers: DEFAULT_MAX_WORKERS,
-  perfLimit: 80
+  perfLimit: 80,
+  taskTimeoutSec: 21600,   // 单集/拼接 ffmpeg 执行超时（秒，0=用默认）
+  memoryLimitMB: 0,        // 单进程内存上限（MB，0=不限制）
+  cpuThreshold: 90,        // CPU 持续高于该值 → 暂停提交新任务（0=不启用）
+  ioThresholdMBps: 500     // 磁盘吞吐高于该值 → 暂停提交新任务（0=不启用）
+                           // 实测本机 NVMe SSD 持续写入约 1074~1215 MB/s，取约 40% 作为更早介入的饱和保护阈值
 })
 
 // ---------- 参数预设 ----------
@@ -467,6 +557,57 @@ const elapsedText = computed(() => formatDuration(elapsedSeconds.value))
 // ---------- 双时长统计（性能限制卡片展示）----------
 // renderText = FFmpeg 实际渲染总时长（进度统计只用它）；queueText = 排队等待总时长（不计入渲染耗时）
 const durationStats = ref({ renderText: '00:00:00', queueText: '00:00:00' })
+
+// ---------- 日志分级过滤 ----------
+// 后端每行日志带 [DEBUG]/[INFO]/[WARN]/[ERROR] 前缀；旧行无前缀视为 INFO。
+// 用户可选择「只看报错」屏蔽全部正常任务日志，保持日志窗口干净。
+const logLevel = ref('INFO')
+const LOG_ORDER = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 }
+const filteredLog = computed(() => {
+  const raw = task.value?.log || ''
+  if (!raw) return ''
+  const min = LOG_ORDER[logLevel.value] ?? LOG_ORDER.INFO
+  return raw
+    .split('\n')
+    .filter((line) => {
+      const matched = /^\[(DEBUG|INFO|WARN|ERROR)\]/.exec(line)
+      const level = matched ? LOG_ORDER[matched[1]] : LOG_ORDER.INFO
+      return level >= min
+    })
+    .join('\n')
+})
+
+// ---------- 系统资源监控（页面每 2 秒轮询后端快照）----------
+const resourceStats = ref({
+  supported: true,
+  cpuPercent: 0,
+  diskReadMBps: 0,
+  diskWriteMBps: 0,
+  processCount: 0,
+  cpuHigh: false,
+  ioHigh: false,
+  throttled: false
+})
+let resourceTimer = null
+
+// 资源状态标签：饱和（后台已暂停提交新任务）/ 正常 / 不支持
+const resourceStatusLabel = computed(() => {
+  if (!resourceStats.value.supported) return '不支持'
+  return resourceStats.value.throttled ? '资源饱和 · 已暂停提交' : '正常'
+})
+const resourceTagType = computed(() => {
+  if (!resourceStats.value.supported) return 'info'
+  return resourceStats.value.throttled ? 'danger' : 'success'
+})
+
+async function refreshResources() {
+  try {
+    const res = await api.getSystemResources()
+    if (res) resourceStats.value = { ...resourceStats.value, ...res }
+  } catch {
+    // 后端未就绪时静默忽略，等待下次轮询
+  }
+}
 
 // ---------- 任务结束弹窗（全部成功 / 存在失败项，仅【确定】关闭） ----------
 const completionDialog = ref(false)
@@ -773,7 +914,9 @@ function buildPayload() {
     },
     subtitle: {
       enabled: form.subtitleEnabled,
-      style: { ...form.subtitleStyle }
+      style: { ...form.subtitleStyle },
+      fontFile: form.fontFile,
+      fontsDir: form.fontsDir
     },
     output: {
       mergeVideo: form.mergeVideo,
@@ -788,7 +931,11 @@ function buildPayload() {
     performance: {
       parallelEnabled: form.parallelEnabled,
       maxWorkers: form.maxWorkers,
-      perfLimit: form.perfLimit
+      perfLimit: form.perfLimit,
+      taskTimeoutSec: form.taskTimeoutSec,
+      memoryLimitMB: form.memoryLimitMB,
+      cpuThreshold: form.cpuThreshold,
+      ioThresholdMBps: form.ioThresholdMBps
     }
   }
 }
@@ -916,11 +1063,19 @@ function showCompletion(res) {
   completionDialog.value = true
 }
 
-// 组件卸载时清理定时器
-onBeforeUnmount(stopPolling)
+// 组件卸载时清理定时器（任务轮询 + 资源监控轮询）
+onBeforeUnmount(() => {
+  stopPolling()
+  if (resourceTimer) {
+    clearInterval(resourceTimer)
+    resourceTimer = null
+  }
+})
 
-// 初始化：加载预设列表
+// 初始化：加载预设列表 + 启动系统资源监控轮询（2 秒一次，独立于任务轮询）
 loadPresets()
+refreshResources()
+resourceTimer = setInterval(refreshResources, 2000)
 </script>
 
 <style scoped>
@@ -1090,8 +1245,12 @@ loadPresets()
   color: #f56c6c;
 }
 
-/* 日志区 */
+/* 日志区：标题与「日志级别」下拉左右分布 */
 .log-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin-top: 12px;
   font-size: 13px;
   font-weight: 600;

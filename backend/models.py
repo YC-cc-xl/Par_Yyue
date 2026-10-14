@@ -226,9 +226,19 @@ def update_task(task_id: int, **fields: Any) -> Optional[dict[str, Any]]:
     return get_task(task_id)
 
 
-def append_task_log(task_id: int, text: str) -> None:
-    """向任务日志追加一行（并发渲染时由各集线程调用，内部已加锁）"""
-    line = text.rstrip("\n") + "\n"
+# 日志级别（由低到高）：DEBUG < INFO < WARN < ERROR
+LOG_LEVELS = ("DEBUG", "INFO", "WARN", "ERROR")
+
+
+def append_task_log(task_id: int, text: str, level: str = "INFO") -> None:
+    """向任务日志追加一行（并发渲染时由各集线程调用，内部已加锁）
+
+    每行以 [LEVEL] 前缀标记级别，前端按级别过滤展示（用户可选择只看报错）。
+    """
+    tag = level.upper()
+    if tag not in LOG_LEVELS:
+        tag = "INFO"
+    line = f"[{tag}] {text}".rstrip("\n") + "\n"
     with _WRITE_LOCK, _connect() as conn:
         conn.execute(
             """

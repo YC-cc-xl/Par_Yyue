@@ -22,12 +22,14 @@ from pathlib import Path
 from typing import Any
 
 import models
+import system_monitor
 from ffmpeg_render import (
     render_episode,
     concat_videos,
     locate_ffmpeg,
     terminate_process,
     resolve_encoder,
+    probe_media,
     ENGINE_LABELS,
     FfmpegNotFound,
 )
@@ -38,6 +40,11 @@ MERGE_FILE_NAME = "合并视频.mp4"
 
 # 任务日志中单集 ffmpeg 输出的保留行数
 LOG_TAIL_LINES = 12
+
+# 高负载任务判定阈值：负载分 = (像素数 / 1280×720) × 时长(秒)。
+# 超过阈值视为「高负载任务」，用独立信号量限制其并发，避免多个大视频同时抢占全部 CPU；
+# 短任务不受影响，可继续跑满线程池，从而提升整体吞吐。
+HIGH_LOAD_SCORE = 900.0
 
 # ---------------------------------------------------------------------------
 # 运行时进度注册表（供 GET /api/compose/tasks/{id}/progress 读取）
@@ -224,6 +231,32 @@ def _resolve_threads(config: dict[str, Any]) -> int:
     return max(1, min(_cpu_count(), round(_cpu_count() * limit / 100.0)))
 
 
+def _estimate_load(media: dict[str, Any], output_cfg: dict[str, Any]) -> float:
+    """按（分辨率 × 时长）预估单个任务的 CPU 负载分
+
+    以 1280×720 为基准：负载分 = (像素数 / 基准像素) × 时长(秒)。
+    分辨率越高、时长越长，负载分越大；用于「高负载任务限制并发」与长任务错峰排队。
+    """
+    width = int(media.get("width") or output_cfg.get("width") or 1280)
+    height = int(media.get("height") or output_cfg.get("height") or 720)
+    duration = float(media.get("duration") or 0.0)
+    base_pixels = 1280 * 720
+    return round(max(1, width * height) / base_pixels * max(1.0, duration), 2)
+
+
+def _saturation_reason() -> str:
+    """把当前资源饱和原因格式化为可读文本（供日志展示）"""
+    snap = system_monitor.snapshot()
+    parts: list[str] = []
+    if snap.get("cpuHigh"):
+        parts.append(f"CPU {snap.get('cpuPercent', 0)}%")
+    if snap.get("ioHigh"):
+        io = float(snap.get("diskReadMBps") or 0.0) + float(snap.get("diskWriteMBps") or 0.0)
+        parts.append(f"磁盘IO {io:.1f}MB/s")
+    detail = "、".join(parts) if parts else "CPU/磁盘IO"
+    return f"系统资源占用过高（{detail}）"
+
+
 # ---------------------------------------------------------------------------
 # 任务执行
 # ---------------------------------------------------------------------------
@@ -237,7 +270,7 @@ def _run_task(task_id: int) -> None:
     try:
         _execute(task_id, task)
     except Exception as exc:  # 兜底：任何未预期异常都不能让任务卡在 running
-        models.append_task_log(task_id, f"[错误] 任务执行异常：{exc}")
+        models.append_task_log(task_id, f"[错误] 任务执行异常：{exc}", "ERROR")
         models.update_task(task_id, status="failed")
     finally:
         # 收尾：清掉该任务的进程登记，避免长期运行后注册表无限增长
@@ -256,7 +289,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
     except FfmpegNotFound:
         ffmpeg_path = None
     if ffmpeg_path is None:
-        models.append_task_log(task_id, "[错误] 未找到 ffmpeg.exe，无法开始渲染")
+        models.append_task_log(task_id, "[错误] 未找到 ffmpeg.exe，无法开始渲染", "ERROR")
         models.update_task(task_id, status="failed")
         return
 
@@ -264,7 +297,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
     scan = scan_episodes(source_dir)
     episodes = scan["episodes"]
     if not episodes:
-        models.append_task_log(task_id, "[错误] 未扫描到任何分集")
+        models.append_task_log(task_id, "[错误] 未扫描到任何分集", "ERROR")
         models.update_task(task_id, total=0, status="failed")
         return
 
@@ -276,11 +309,32 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
     workers = _resolve_workers(config)
     threads = _resolve_threads(config)
     output_cfg = config.get("output") or {}
+    performance = config.get("performance") or {}
+
+    # 进程防护参数：可配置超时（0/缺省=用默认）与单进程内存上限（0=不限）
+    try:
+        task_timeout = int(performance.get("taskTimeoutSec") or 0)
+    except (TypeError, ValueError):
+        task_timeout = 0
+    try:
+        memory_limit = int(performance.get("memoryLimitMB") or 0)
+    except (TypeError, ValueError):
+        memory_limit = 0
+
+    # 系统资源监控：写入用户配置的饱和阈值并启动后台采样线程（幂等）
+    system_monitor.configure(
+        cpu_threshold=performance.get("cpuThreshold"),
+        io_threshold_mbps=performance.get("ioThresholdMBps"),
+    )
+    system_monitor.start()
 
     # ---- 2. 组装渲染工作项：一组「合格素材（mp4+mp3+srt 同名）」= 一个渲染单位 ----
     jobs: list[dict[str, Any]] = []
     for episode in episodes:
         for group in episode.get("groups") or []:
+            # 预解析缓存里已含分辨率/时长（扫描阶段预热），直接读用于负载预估与排序
+            media = probe_media(Path(group["videoPath"]))
+            score = _estimate_load(media, output_cfg)
             jobs.append(
                 {
                     "index": episode["index"],
@@ -290,8 +344,16 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                     "audioPath": group["audioPath"],
                     "subtitlePath": group["subtitlePath"],
                     "missing": [],
+                    "duration": float(media.get("duration") or 0.0),
+                    "loadScore": score,
+                    "highLoad": score >= HIGH_LOAD_SCORE,
                 }
             )
+
+    # 任务智能调度排序：短素材优先执行（短任务快速释放线程，提升整体吞吐）；
+    # 长/高负载素材自动错峰排在后面，避免多个长视频同时抢占全部 CPU。
+    jobs.sort(key=lambda job: (job["duration"], job["index"], job["groupName"]))
+    high_load_jobs = sum(1 for job in jobs if job["highLoad"])
 
     # 运行时进度：全局 + 每个分集独立维护，供前端表格逐行显示进度与状态
     state: dict[str, Any] = {
@@ -333,6 +395,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
         task_id,
         f"[任务] 共 {len(episodes)} 集，有效素材 {len(jobs)} 组，并发数 {workers}，"
         f"每进程编码线程 {threads}",
+        "INFO",
     )
     # 编码引擎：页面选 auto 时按 NVENC > QSV > AMF 优先级自动挑选可用硬件编码器，
     # 不可用则降级 CPU 软编码；这里解析一次并写入日志（字幕硬烧仍由 CPU 完成）
@@ -346,16 +409,35 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
         f" → {ENGINE_LABELS.get(engine_key, engine_key)}（{engine_codec}）"
         f"{'，字幕硬烧由 CPU 完成' if (config.get('subtitle') or {}).get('enabled') else ''}，"
         f"输出目录：{output_root}",
+        "INFO",
+    )
+    # 调度策略与进程防护参数（本次生效口径）
+    models.append_task_log(
+        task_id,
+        f"[调度] 短素材优先执行；高负载任务 {high_load_jobs} 组（阈值 {HIGH_LOAD_SCORE:g}）限制并发；"
+        f"任务超时 {task_timeout if task_timeout > 0 else '默认 21600'} 秒，"
+        f"单进程内存上限 {memory_limit if memory_limit > 0 else '不限制'}MB，"
+        f"资源保护阈值 CPU {performance.get('cpuThreshold', 90)}% / 磁盘IO "
+        f"{performance.get('ioThresholdMBps', 0)}MB/s（0=不启用）",
+        "INFO",
     )
 
     # 被跳过的素材逐条提示，明确告知缺少哪个文件（不统计、不渲染）
     for episode in episodes:
         for reason in episode.get("skipped") or []:
-            models.append_task_log(task_id, f"[第{episode['index']}集 {episode['name']}] 跳过 {reason}")
+            models.append_task_log(
+                task_id,
+                f"[第{episode['index']}集 {episode['name']}] 跳过 {reason}",
+                "WARN",
+            )
     models.append_task_log(task_id, "=" * 60)
 
     if not jobs:
-        models.append_task_log(task_id, "[错误] 没有任何一组合格素材（视频/音频需同名配对），无法开始渲染")
+        models.append_task_log(
+            task_id,
+            "[错误] 没有任何一组合格素材（视频/音频需同名配对），无法开始渲染",
+            "ERROR",
+        )
         models.update_task(task_id, progress=0.0, status="failed")
         return
 
@@ -365,9 +447,13 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
 
     # 取消意向在渲染开始前就已生效 → 直接收敛，不提交任何渲染任务
     if state["canceled"]:
-        models.append_task_log(task_id, "[取消] 任务在开始渲染前已被取消")
+        models.append_task_log(task_id, "[取消] 任务在开始渲染前已被取消", "WARN")
         models.update_task(task_id, status="canceled")
         return
+
+    # 高负载任务并发闸门：把大视频同时运行的数量压到并发数的一半，
+    # 避免多个长任务同时抢占全部 CPU（短任务不经过闸门，可跑满线程池）
+    high_load_gate = threading.Semaphore(max(1, workers // 2))
 
     def render_one(job: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Path, float, float]:
         """渲染单组素材（在线程池中执行）
@@ -376,6 +462,13 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
           - queue_seconds：任务入队 → ffmpeg 进程真正启动之间的排队等待
           - render_seconds：ffmpeg 启动 → 渲染结束的实际编码耗时（不含排队）
         """
+        if job.get("highLoad"):
+            # 高负载任务先取得闸门，限制其并发数量
+            with high_load_gate:
+                return _render_one_inner(job)
+        return _render_one_inner(job)
+
+    def _render_one_inner(job: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Path, float, float]:
         episode_dir = output_root / job["name"]
         episode_dir.mkdir(parents=True, exist_ok=True)
         out_file = episode_dir / f"{job['groupName']}.mp4"
@@ -387,6 +480,11 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
             # ffmpeg 真正启动的瞬间 = 渲染计时起点（与入队时刻之差即排队等待）
             spawn_holder["ts"] = time.monotonic()
             register_proc(task_id, proc)
+            system_monitor.track_pid(proc.pid)   # 纳入磁盘读写汇总
+
+        def _on_release(proc: subprocess.Popen) -> None:
+            release_proc(task_id, proc)
+            system_monitor.untrack_pid(proc.pid)
 
         result = render_episode(
             job,
@@ -394,9 +492,11 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
             config,
             work_sub_name=f"sub_{task_id}_{job['index']:03d}_{job['groupName']}.ass",
             threads=threads,
+            timeout=task_timeout,
+            memory_limit_mb=memory_limit,
             # 交出 ffmpeg 句柄：取消时可立即强杀；is_canceled 用于区分「被强杀」与真实失败
             on_spawn=_on_spawn,
-            on_release=lambda proc: release_proc(task_id, proc),
+            on_release=_on_release,
             is_canceled=lambda: state["canceled"],
         )
         ended = time.monotonic()
@@ -412,7 +512,23 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="render") as pool:
         futures: dict[Any, dict[str, Any]] = {}
+        paused_logged = False
         for job in jobs:
+            if state["canceled"]:
+                break
+            # 系统资源监控 + 动态并发保护：CPU 持续高于阈值 / 磁盘 IO 满载时，
+            # 自动临时停止提交新任务，等待资源回落再继续入队，避免系统卡死。
+            if system_monitor.is_saturated():
+                if not paused_logged:
+                    paused_logged = True
+                    models.append_task_log(
+                        task_id, f"[资源] {_saturation_reason()}，暂停提交新任务，等待回落…", "WARN"
+                    )
+                while not state["canceled"] and system_monitor.is_saturated():
+                    time.sleep(1.0)
+                if paused_logged and not state["canceled"]:
+                    paused_logged = False
+                    models.append_task_log(task_id, "[资源] 系统资源已回落，继续提交任务", "INFO")
             job["enqueueTs"] = time.monotonic()   # 入队时刻（统计排队等待时长用）
             futures[pool.submit(render_one, job)] = job
         for future in as_completed(futures):
@@ -433,6 +549,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                         task_id,
                         f"{label} 已终止（任务取消）｜排队 {_format_duration(queue_seconds or 0.0)}，"
                         f"已渲染 {_format_duration(render_seconds or 0.0)}",
+                        "WARN",
                     )
                 else:
                     episode_state["done"] += 1
@@ -450,9 +567,10 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                             task_id,
                             f"{label} 成功 → {out_file}｜排队 {_format_duration(queue_seconds or 0.0)}，"
                             f"渲染 {_format_duration(render_seconds or 0.0)}",
+                            "INFO",
                         )
                         for warning in result.get("warnings") or []:
-                            models.append_task_log(task_id, f"{label} 警告：{warning}")
+                            models.append_task_log(task_id, f"{label} 警告：{warning}", "WARN")
                     else:
                         state["failed"] += 1
                         episode_state["failed"] += 1
@@ -461,9 +579,10 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                             f"{label} 失败：{result.get('error', '未知错误')}｜排队 "
                             f"{_format_duration(queue_seconds or 0.0)}，"
                             f"渲染 {_format_duration(render_seconds or 0.0)}",
+                            "ERROR",
                         )
                         for line in _tail_lines(result.get("log") or "", LOG_TAIL_LINES):
-                            models.append_task_log(task_id, f"{label} | {line}")
+                            models.append_task_log(task_id, f"{label} | {line}", "DEBUG")
 
                     state["doneGroups"] += 1
                     # 分集状态：有失败 → failed；全部完成且无失败 → success；否则渲染中
@@ -491,6 +610,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
                             f"[第{job['index']}集 {job['name']}] 本集渲染完成，"
                             f"FFmpeg 渲染耗时 {episode_state['durationText']}，"
                             f"排队等待 {episode_state['queueText']}",
+                            "INFO",
                         )
 
                     models.update_task(
@@ -508,7 +628,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
 
     # ---- 4. 合并视频（取消时跳过，避免继续产出半成品合并件） ----
     if state["canceled"]:
-        models.append_task_log(task_id, "[取消] 任务已取消，跳过合并视频")
+        models.append_task_log(task_id, "[取消] 任务已取消，跳过合并视频", "WARN")
     elif output_cfg.get("mergeVideo"):
         _build_merged(task_id, config, output_root, outputs, episodes)
 
@@ -525,6 +645,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
             f"已完成 {state['doneGroups']} / {state['totalGroups']} 组素材"
             f"｜FFmpeg 渲染总耗时 {_format_duration(render_total)}，"
             f"排队等待总时长 {_format_duration(queue_total)}",
+            "WARN",
         )
         return
 
@@ -537,6 +658,7 @@ def _execute(task_id: int, task: dict[str, Any]) -> None:
         f"共 {len(episodes)} 集 / {state['totalGroups']} 组素材"
         f"｜FFmpeg 渲染总耗时 {_format_duration(render_total)}，"
         f"排队等待总时长 {_format_duration(queue_total)}",
+        "ERROR" if state["failed"] else "INFO",
     )
 
 
@@ -557,12 +679,22 @@ def _build_merged(
     - 合并原视频与第一集：在合并视频最前面拼接【第一集第一组素材的原始视频】（作为片头）
     """
     output_cfg = config.get("output") or {}
+    performance = config.get("performance") or {}
+    try:
+        task_timeout = int(performance.get("taskTimeoutSec") or 0)
+    except (TypeError, ValueError):
+        task_timeout = 0
+    try:
+        memory_limit = int(performance.get("memoryLimitMB") or 0)
+    except (TypeError, ValueError):
+        memory_limit = 0
+
     ordered: list[Path] = []
     for index in sorted(outputs):
         for _, out_file in sorted(outputs[index], key=lambda item: item[0].lower()):
             ordered.append(out_file)
     if not ordered:
-        models.append_task_log(task_id, "[合并] 没有可合并的成功素材组，跳过合并")
+        models.append_task_log(task_id, "[合并] 没有可合并的成功素材组，跳过合并", "WARN")
         return
 
     parts: list[Path] = []
@@ -571,20 +703,30 @@ def _build_merged(
         first_video = Path(first_episode["groups"][0]["videoPath"]) if first_episode else None
         if first_video and first_video.is_file():
             parts.append(first_video)
-            models.append_task_log(task_id, f"[合并] 已加入第一集原视频作为片头：{first_video.name}")
+            models.append_task_log(task_id, f"[合并] 已加入第一集原视频作为片头：{first_video.name}", "INFO")
         else:
-            models.append_task_log(task_id, "[合并] 未找到第一集原视频，跳过片头")
+            models.append_task_log(task_id, "[合并] 未找到第一集原视频，跳过片头", "WARN")
 
     parts.extend(ordered)
 
     merged_file = output_root / MERGE_FILE_NAME
-    models.append_task_log(task_id, f"[合并] 开始拼接 {len(parts)} 个片段 → {merged_file}")
+    models.append_task_log(task_id, f"[合并] 开始拼接 {len(parts)} 个片段 → {merged_file}", "INFO")
 
-    # 合并阶段的 ffmpeg 同样登记进程：取消时可立即强杀并清理半成品
+    # 合并阶段的 ffmpeg 同样登记进程：取消时可立即强杀并清理半成品，并纳入磁盘读写汇总
+    def _on_spawn(proc: subprocess.Popen) -> None:
+        register_proc(task_id, proc)
+        system_monitor.track_pid(proc.pid)
+
+    def _on_release(proc: subprocess.Popen) -> None:
+        release_proc(task_id, proc)
+        system_monitor.untrack_pid(proc.pid)
+
     proc_callbacks = {
-        "on_spawn": lambda proc: register_proc(task_id, proc),
-        "on_release": lambda proc: release_proc(task_id, proc),
+        "on_spawn": _on_spawn,
+        "on_release": _on_release,
         "is_canceled": lambda: is_task_canceled(task_id),
+        "timeout": task_timeout,
+        "memory_limit_mb": memory_limit,
     }
 
     if output_cfg.get("mergeWithFirst") and len(parts) > 1:
@@ -606,13 +748,13 @@ def _build_merged(
         result = concat_videos(parts, merged_file, **proc_callbacks)
 
     if result.get("canceled"):
-        models.append_task_log(task_id, "[合并] 已终止（任务取消），半成品已清理")
+        models.append_task_log(task_id, "[合并] 已终止（任务取消），半成品已清理", "WARN")
     elif result.get("success"):
-        models.append_task_log(task_id, f"[合并] 完成 → {merged_file}")
+        models.append_task_log(task_id, f"[合并] 完成 → {merged_file}", "INFO")
     else:
-        models.append_task_log(task_id, f"[合并] 失败：{result.get('error', '未知错误')}")
+        models.append_task_log(task_id, f"[合并] 失败：{result.get('error', '未知错误')}", "ERROR")
         for line in _tail_lines(result.get("log") or "", LOG_TAIL_LINES):
-            models.append_task_log(task_id, f"[合并] | {line}")
+            models.append_task_log(task_id, f"[合并] | {line}", "DEBUG")
 
 
 # ---------------------------------------------------------------------------
