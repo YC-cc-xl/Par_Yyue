@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import models
-from scanner import scan_episodes
+from scanner import scan_projects
 
 # 系统资源监控（零依赖 ctypes 实现）；不可用时接口返回「不支持」，不影响渲染流程
 try:
@@ -38,12 +38,21 @@ except ImportError:  # pragma: no cover
 
 # 阶段6 提供的并发渲染入口；未就绪时给出明确提示而不是崩溃
 try:
-    from task_runner import start_task_async, get_task_progress, request_cancel, get_cancel_at
+    from task_runner import (
+        start_task_async,
+        get_task_progress,
+        request_cancel,
+        get_cancel_at,
+        set_project_paused,
+        cancel_project,
+    )
 except ImportError:  # pragma: no cover - 阶段6 之前会走到这里
     start_task_async = None
     get_task_progress = None
     request_cancel = None
     get_cancel_at = None
+    set_project_paused = None
+    cancel_project = None
 
 DEFAULT_PORT = 8123
 
@@ -75,7 +84,10 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 class ScanRequest(BaseModel):
-    sourceDir: str = Field(..., description="分集根目录")
+    # 新增：支持批量加载多个一级项目根目录（每个元素 = 一个项目）
+    sourceDirs: list[str] = Field(default_factory=list, description="一级项目根目录列表")
+    # 兼容旧协议：单个根目录
+    sourceDir: str = Field("", description="分集根目录（单个，兼容旧协议）")
 
 
 class PresetRequest(BaseModel):
@@ -120,10 +132,28 @@ class PerformanceConfig(BaseModel):
     # 系统资源保护阈值：CPU 持续高于该值 / 磁盘吞吐高于该值 → 暂停提交新任务（0=不启用该判据）
     cpuThreshold: int = 90
     ioThresholdMBps: float = 0.0
+    # 调度模式：multi 高性能多任务模式 / serial 低配单任务串行模式
+    scheduleMode: str = "multi"
+    # 调度策略：project_first 项目优先 / even 均分任务（串行模式下固定为项目优先）
+    schedulePolicy: str = "project_first"
+
+
+class ProjectConfig(BaseModel):
+    """一级项目条目：根目录 + 该项自己的合并勾选
+
+    合并按项目独立控制：项目 A 勾选只合并 A，项目 B 不勾选就不合并 B。
+    """
+    root: str = Field("", description="一级项目根目录")
+    mergeVideo: bool = Field(False, description="创建合并视频（按分集顺序拼接）")
+    mergeWithFirst: bool = Field(False, description="合并原视频与第一集（加原片头）")
 
 
 class TaskRequest(BaseModel):
-    sourceDir: str
+    # 新增：多项目列表（每项自带合并勾选，实现「按项目独立合并」）
+    projects: list[ProjectConfig] = Field(default_factory=list)
+    # 兼容旧协议：sourceDirs 列表 / sourceDir 单值（合并开关取 output.mergeVideo）
+    sourceDirs: list[str] = Field(default_factory=list)
+    sourceDir: str = ""
     bgm: BgmConfig = Field(default_factory=BgmConfig)
     subtitle: SubtitleConfig = Field(default_factory=SubtitleConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
@@ -209,13 +239,16 @@ def system_resources() -> dict:
 
 @app.post("/api/compose/scan")
 def scan(req: ScanRequest) -> dict:
-    """扫描根目录：一级子文件夹 = 一个分集"""
+    """扫描一个或多个一级项目根目录（三层目录：项目 → 分集 → 视频/音频）"""
     # 空字符串/纯空白必须显式拦截：Path("") 等价于 Path(".")，
-    # 会被放进 scan_episodes 扫描后端进程的当前工作目录
-    if not (req.sourceDir or "").strip():
+    # 会被扫描到后端进程的当前工作目录
+    dirs = [str(item).strip() for item in (req.sourceDirs or []) if str(item or "").strip()]
+    if not dirs and (req.sourceDir or "").strip():
+        dirs = [req.sourceDir.strip()]
+    if not dirs:
         raise HTTPException(status_code=400, detail="处理来源目录不能为空")
     try:
-        result = scan_episodes(req.sourceDir)
+        result = scan_projects(dirs)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except NotADirectoryError as e:
@@ -223,38 +256,56 @@ def scan(req: ScanRequest) -> dict:
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=f"没有访问权限：{e}")
 
-    # 在原有返回值上追加两部分数据（episodes 的既有字段保持可用）：
-    #   detail  → 分集明细，供页面表格渲染（一行 = 一个分集文件夹）
-    #   summary → 全局汇总，供页面【全局统计栏】渲染
+    # 在扫描结果上追加三部分数据：
+    #   detail          → 分集明细，供页面表格渲染（一行 = 一个二级分集文件夹）
+    #   projectWarnings → 项目级告警（如某个分集缺【视频】/【音频】文件夹）
+    #   summary         → 全局汇总，供页面【全局统计栏】渲染
     detail = []
-    for episode in result.get("episodes", []):
-        groups = episode.get("groups") or []
-        detail.append(
-            {
-                "index": episode["index"],
-                "name": episode["name"],
-                "audioCount": len(groups),                  # 合格素材组数（mp4+mp3+srt 同名）
-                "videoCount": episode.get("videoCount", 0),  # 该分集内 mp4 数量
-                # 分集内部任务列表：一组合格素材 = 一个渲染任务
-                "tasks": [
-                    {
-                        "name": group["name"],
-                        "videoPath": group["videoPath"],
-                        "audioPath": group["audioPath"],
-                        "subtitlePath": group["subtitlePath"],
-                    }
-                    for group in groups
-                ],
-                "skipped": episode.get("skipped") or [],
-            }
-        )
+    project_warnings = []
+    for project in result["projects"]:
+        for warning in project.get("warnings") or []:
+            project_warnings.append(
+                {
+                    "projectIndex": project["index"],
+                    "projectName": project["name"],
+                    "text": warning,
+                }
+            )
+        for episode in project["episodes"]:
+            groups = episode["groups"]
+            detail.append(
+                {
+                    # 复合键：多项目并存时，各项目的分集序号会重复，用「项目-分集」唯一标识
+                    "key": f"{project['index']}-{episode['index']}",
+                    "projectIndex": project["index"],
+                    "projectName": project["name"],
+                    "index": episode["index"],
+                    "name": episode["name"],
+                    "audioCount": len(groups),                   # 合格素材组数（mp4+mp3+srt 同名）
+                    "videoCount": episode["videoCount"],          # 该分集内 mp4 数量
+                    "pendingCount": episode["pendingCount"],      # 待渲染组数
+                    "resumedCount": episode["resumedCount"],      # 成品已存在、断点续跑跳过数
+                    # 分集内部任务列表：一组合格素材 = 一个渲染任务
+                    "tasks": [
+                        {
+                            "name": group["name"],
+                            "videoPath": group["videoPath"],
+                            "audioPath": group["audioPath"],
+                            "subtitlePath": group["subtitlePath"],
+                            "outputPath": group["outputPath"],
+                            "resumed": group["resumed"],
+                        }
+                        for group in groups
+                    ],
+                    "skipped": episode["skipped"],
+                }
+            )
     result["detail"] = detail
+    result["projectWarnings"] = project_warnings
     result["summary"] = {
-        "episodeTotal": len(detail),
-        # 有效分集：至少含一组合格素材的分集
-        "validEpisodeTotal": sum(1 for item in detail if item["audioCount"] > 0),
-        "audioTotal": sum(item["audioCount"] for item in detail),
-        "videoTotal": sum(item["videoCount"] for item in detail),
+        **result["summary"],
+        # 兼容旧字段名：audioTotal = 合格素材组总数
+        "audioTotal": result["summary"].get("groupTotal", 0),
     }
     return result
 
@@ -285,27 +336,44 @@ def presets_delete(preset_id: int) -> dict:
 @app.post("/api/compose/tasks")
 def tasks_create(req: TaskRequest) -> dict:
     """创建批量合成任务：先落库，再交给并发渲染模块处理"""
+    # 项目列表解析：优先 projects（每项自带合并勾选，按项目独立控制合并），
+    # 回退到旧协议 sourceDirs / sourceDir（此时合并开关取 output 配置）
+    root_dirs = [
+        str(item.root).strip() for item in (req.projects or []) if str(item.root or "").strip()
+    ]
+    if not root_dirs:
+        root_dirs = [str(d).strip() for d in (req.sourceDirs or []) if str(d or "").strip()]
+    if not root_dirs and (req.sourceDir or "").strip():
+        root_dirs = [req.sourceDir.strip()]
     # 同 scan：空值/纯空白若放行会被 Path("") 误判为当前工作目录
-    if not (req.sourceDir or "").strip():
+    if not root_dirs:
         raise HTTPException(status_code=400, detail="处理来源目录不能为空")
-    source_dir = Path(req.sourceDir).expanduser()
-    if not source_dir.exists() or not source_dir.is_dir():
-        raise HTTPException(status_code=400, detail=f"根目录无效：{source_dir}")
+
+    for root in root_dirs:
+        path = Path(root).expanduser()
+        if not path.exists() or not path.is_dir():
+            raise HTTPException(status_code=400, detail=f"项目根目录无效：{path}")
+    source_dir = Path(root_dirs[0]).expanduser()
     if req.bgm.enabled and not req.bgm.file:
         raise HTTPException(status_code=400, detail="已启用背景音乐，但未选择 BGM 文件")
 
     # 先扫描一次拿到分集总数（渲染阶段会再次扫描，保证与实际文件一致）
     try:
-        scan_result = scan_episodes(source_dir)
+        scan_result = scan_projects(root_dirs)
     except (FileNotFoundError, NotADirectoryError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    total = scan_result["total"]
+    total = scan_result["summary"]["episodeTotal"]
     if total == 0:
-        raise HTTPException(status_code=400, detail="该目录下没有找到任何分集子文件夹")
+        raise HTTPException(
+            status_code=400,
+            detail="所选项目下没有找到任何有效分集（二级分集内需同时存在【视频】【音频】文件夹）",
+        )
 
-    # 存任务参数快照（含 sourceDir，供渲染层直接复用）
+    # 存任务参数快照（含项目列表，供渲染层直接复用）；
+    # 同时把解析后的目录列表写回 sourceDirs，便于日志/排查与旧逻辑兜底
     config_snapshot = req.model_dump()
+    config_snapshot["sourceDirs"] = root_dirs
     task = models.create_task(
         source_dir=str(source_dir), total=total, config=config_snapshot, status="pending"
     )
@@ -339,8 +407,11 @@ def tasks_progress(task_id: int) -> dict:
 
     在任务记录的基础上追加：
       totalGroups / doneGroups  全部有效素材组数、已完成渲染的组数
-      episodes                  各分集 { index, name, total, done, success, failed, status }
-    其中 status：pending 待处理 / running 渲染中 / success 成功 / failed 失败
+      resumed / skippedGroups   断点续跑跳过的组数、项目被取消后跳过的组数
+      episodes                  各分集 { key, projectIndex, projectName, index, name,
+                                          total, done, success, failed, status }
+      projects                  各项目 { index, name, paused, canceled, merged, total, done … }
+    其中 status：pending 待处理 / running 渲染中 / success 成功 / failed 失败 / canceled 已取消
     """
     task = models.get_task(task_id)
     if task is None:
@@ -349,7 +420,16 @@ def tasks_progress(task_id: int) -> dict:
     runtime = get_task_progress(task_id) if get_task_progress else None
     if runtime is None:
         # 尚未启动渲染（或后端中途重启）：返回空运行态，表格行保持「待处理」
-        runtime = {"totalGroups": 0, "doneGroups": 0, "success": 0, "failed": 0, "episodes": []}
+        runtime = {
+            "totalGroups": 0,
+            "doneGroups": 0,
+            "success": 0,
+            "failed": 0,
+            "resumed": 0,
+            "skippedGroups": 0,
+            "episodes": [],
+            "projects": [],
+        }
 
     # 用 _with_runtime 包裹：原有 progress/分集状态字段全部保留，
     # 仅追加 elapsed/elapsedSeconds（全局已运行时长），前端统计栏实时刷新用
@@ -358,7 +438,11 @@ def tasks_progress(task_id: int) -> dict:
             **task,
             "totalGroups": runtime["totalGroups"],
             "doneGroups": runtime["doneGroups"],
+            "resumed": runtime.get("resumed", 0),
+            "skippedGroups": runtime.get("skippedGroups", 0),
             "episodes": runtime["episodes"],
+            # 项目级状态：供页面按项目展示进度与「暂停/恢复/取消」按钮
+            "projects": runtime.get("projects", []),
             # 全局双时长：仅用于新增的性能/并发面板展示，不影响原统计栏
             "renderSeconds": runtime.get("renderSeconds", 0),
             "renderText": runtime.get("renderText") or "00:00:00",
@@ -386,6 +470,56 @@ def tasks_cancel(task_id: int) -> dict:
     models.update_task(task_id, status="canceled")
     models.append_task_log(task_id, "[取消] 已请求取消，正在停止后续渲染…")
     return _with_runtime(models.get_task(task_id))
+
+
+# ---------------------------------------------------------------------------
+# 项目级控制（多项目任务：单独暂停/恢复/取消某一个一级项目，不影响其他项目）
+# ---------------------------------------------------------------------------
+
+def _project_control_guard(task_id: int) -> dict:
+    """项目级控制的公共校验：任务必须存在且仍在运行"""
+    if set_project_paused is None or cancel_project is None:
+        raise HTTPException(status_code=503, detail="渲染模块未就绪，无法控制项目")
+    task = models.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.get("status") in ("completed", "failed", "canceled"):
+        raise HTTPException(status_code=400, detail="任务已结束，无法控制项目")
+    return task
+
+
+@app.post("/api/compose/tasks/{task_id}/projects/{project_index}/pause")
+def project_pause(task_id: int, project_index: int) -> dict:
+    """暂停指定项目：未开始的素材组暂不提交，已开始的渲染正常跑完"""
+    _project_control_guard(task_id)
+    if not set_project_paused(task_id, project_index, True):
+        raise HTTPException(status_code=400, detail="项目不存在或任务尚未开始渲染")
+    models.append_task_log(
+        task_id, f"[项目#{project_index}] 已暂停（未开始的任务暂不提交，已开始的渲染会跑完）", "WARN"
+    )
+    return {"success": True, "taskId": task_id, "projectIndex": project_index, "paused": True}
+
+
+@app.post("/api/compose/tasks/{task_id}/projects/{project_index}/resume")
+def project_resume(task_id: int, project_index: int) -> dict:
+    """恢复指定项目：继续提交该项目剩余素材组"""
+    _project_control_guard(task_id)
+    if not set_project_paused(task_id, project_index, False):
+        raise HTTPException(status_code=400, detail="项目不存在或任务尚未开始渲染")
+    models.append_task_log(task_id, f"[项目#{project_index}] 已恢复，继续提交剩余任务", "INFO")
+    return {"success": True, "taskId": task_id, "projectIndex": project_index, "paused": False}
+
+
+@app.post("/api/compose/tasks/{task_id}/projects/{project_index}/cancel")
+def project_cancel(task_id: int, project_index: int) -> dict:
+    """取消指定项目：终止该项目所有未完成素材组（在跑的 ffmpeg 立即强杀），其他项目不受影响"""
+    _project_control_guard(task_id)
+    if not cancel_project(task_id, project_index):
+        raise HTTPException(status_code=400, detail="项目不存在或已处于取消状态")
+    models.append_task_log(
+        task_id, f"[项目#{project_index}] 已取消，该项目剩余任务将跳过", "WARN"
+    )
+    return {"success": True, "taskId": task_id, "projectIndex": project_index, "canceled": True}
 
 
 # ---------------------------------------------------------------------------

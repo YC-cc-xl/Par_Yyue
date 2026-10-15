@@ -1,12 +1,19 @@
-"""分集扫描模块
+"""分集扫描模块（三层目录）
 
-规则：选中根目录后，只遍历【一级子文件夹】，一个子文件夹 = 一个分集；
-每个分集目录内分为【视频】【音频】两个子文件夹，按「去掉扩展名后基础文件名完全相同」配对：
+目录层级（本次改造后）：
+    一级：项目根目录（可批量选择多个）
+      └─ 二级：分集文件夹（一个分集目录 = 一个分集）
+           ├─ 三级：【视频】文件夹（放 .mp4）
+           ├─ 三级：【音频】文件夹（放同名 .mp3 与同名 .srt）
+           └─ 【处理完成】文件夹（渲染后自动创建，成品 mp4 落在这里）
 
-    视频\\xxx.mp4  +  音频\\xxx.mp3  +  音频\\xxx.srt   →  一组有效素材
+规则要点：
+  1. 二级分集内必须同时存在【视频】【音频】两个三级文件夹，否则整集跳过并告警
+  2. 素材配对【只在同一个二级分集内部】进行，跨二级分集、跨一级项目一律禁止
+  3. 配对：视频\\xxx.mp4 + 音频\\xxx.mp3 + 音频\\xxx.srt 三者主文件名完全一致 → 一组任务；
+     缺任一项记入 skipped 告警，跳过本组
+  4. 断点续跑：成品（分集\\处理完成\\xxx.mp4）已存在 → 该组标记 resumed，不重复渲染
 
-缺少 mp4 / mp3 / srt 中任意一项都不算有效组：不统计、不渲染，
-并记录原因（缺哪个文件）供任务日志提示。
 （该模块被 FastAPI 接口层与并发渲染层共用，避免逻辑重复）
 """
 
@@ -26,9 +33,10 @@ SUBTITLE_EXTS = (".srt",)
 VIDEO_DIR_NAME = "视频"
 AUDIO_DIR_NAME = "音频"
 
-# 输出目录名（由 task_runner 创建在「处理来源」根目录下）。
-# 扫描时必须跳过，否则对同一根目录二次扫描会把输出目录误当成一个分集，
-# 进而在后续合成中多出一条「缺少配音」的失败记录。
+# 成品输出目录名：创建在【二级分集文件夹】内（渲染前由调度层创建）
+DONE_DIR_NAME = "处理完成"
+
+# 旧版根级输出目录名。扫描一级项目目录时仍需跳过，避免历史遗留目录被当成一个分集
 OUTPUT_DIR_NAME = "自动合成输出"
 
 
@@ -137,27 +145,9 @@ def scan_episode(sub_dir: Path) -> dict[str, Any]:
     }
 
 
-def scan_episodes(root_dir: str | Path) -> dict[str, Any]:
-    """扫描根目录，返回分集清单
-
-    返回结构：
-      { "root": str, "total": int, "episodes": [ 分集条目 ] }
-    分集条目字段：
-      index/name/dirPath                分集序号、目录名、目录绝对路径
-      groups                            有效素材组列表（一组 = mp4+mp3+srt 同名）
-      skipped                           被跳过的素材及缺失原因
-      videoCount                        该分集内 mp4 素材数量
-      videoPath/audioPath/subtitlePath  兼容字段：取第一组有效素材，无有效组时为空
-      missing                           兼容字段：无有效组时为 ["视频", "配音"]
-    """
-    root = Path(root_dir).expanduser().resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"根目录不存在：{root}")
-    if not root.is_dir():
-        raise NotADirectoryError(f"所选路径不是文件夹：{root}")
-
-    # 只取一级子文件夹作为分集，按名称排序保证顺序稳定；跳过输出目录
-    sub_dirs = sorted(
+def _list_sub_dirs(root: Path) -> list[Path]:
+    """列出项目根目录下的二级分集文件夹（忽略隐藏目录与旧版输出目录），按名称排序"""
+    return sorted(
         (
             p
             for p in root.iterdir()
@@ -166,34 +156,84 @@ def scan_episodes(root_dir: str | Path) -> dict[str, Any]:
         key=lambda p: p.name.lower(),
     )
 
-    episodes: list[dict[str, Any]] = []
-    for index, sub_dir in enumerate(sub_dirs, start=1):
-        scanned = scan_episode(sub_dir)
-        groups = scanned["groups"]
-        first = groups[0] if groups else None
 
+def _has_material_dirs(sub_dir: Path) -> bool:
+    """二级分集内必须同时存在【视频】【音频】两个三级文件夹才算有效分集"""
+    return (sub_dir / VIDEO_DIR_NAME).is_dir() and (sub_dir / AUDIO_DIR_NAME).is_dir()
+
+
+def scan_project(root_dir: str | Path, index: int = 1) -> dict[str, Any]:
+    """扫描单个一级项目根目录
+
+    返回：
+      index/name/root                     项目序号、目录名、绝对路径
+      episodes                            分集列表（见下）
+      warnings                            项目级告警（如某个分集缺三级文件夹）
+      taskTotal/taskPending/taskResumed   该项目素材组总数 / 待渲染数 / 已存在跳过数
+
+    分集条目字段：
+      index/name/dirPath                  分集序号、目录名、目录绝对路径
+      groups                              有效素材组（含 outputPath 与 resumed 标记）
+      skipped                             被跳过的素材及缺失原因
+      videoCount/pendingCount/resumedCount 素材数量与待渲染/续跑数量
+    """
+    root = Path(root_dir).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"项目根目录不存在：{root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"所选路径不是文件夹：{root}")
+
+    episodes: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for episode_index, sub_dir in enumerate(_list_sub_dirs(root), start=1):
+        # 三级文件夹校验：缺少【视频】或【音频】任一 → 整集跳过并告警
+        if not _has_material_dirs(sub_dir):
+            warnings.append(
+                f"{sub_dir.name}：缺少【{VIDEO_DIR_NAME}】或【{AUDIO_DIR_NAME}】文件夹，整集跳过"
+            )
+            continue
+
+        scanned = scan_episode(sub_dir)
+        groups: list[dict[str, Any]] = []
+        for group in scanned["groups"]:
+            # 成品固定落在本分集的【处理完成】目录内
+            out_file = sub_dir / DONE_DIR_NAME / f"{group['name']}.mp4"
+            groups.append(
+                {
+                    **group,
+                    "outputPath": str(out_file),
+                    # 断点续跑：成品已存在 → 本组不重复渲染
+                    "resumed": out_file.is_file(),
+                }
+            )
+
+        first = groups[0] if groups else None
         episodes.append(
             {
-                "index": index,
+                "index": episode_index,
                 "name": sub_dir.name,
                 "dirPath": str(sub_dir),
                 "groups": groups,
                 "skipped": scanned["skipped"],
                 "videoCount": scanned["videoCount"],
-                # 兼容原有前端/渲染层字段：取第一组有效素材
+                "pendingCount": sum(1 for g in groups if not g["resumed"]),
+                "resumedCount": sum(1 for g in groups if g["resumed"]),
+                # 兼容字段：取第一组有效素材
                 "videoPath": first["videoPath"] if first else "",
                 "audioPath": first["audioPath"] if first else "",
                 "subtitlePath": first["subtitlePath"] if first else "",
-                "missing": [] if first else ["视频", "配音"],
+                "missing": [] if first else [VIDEO_DIR_NAME, AUDIO_DIR_NAME],
             }
         )
 
-    # 扫描阶段一次性预解析全部源素材（分辨率/编码/采样率/通道）写入内存缓存，
-    # 后续构建 ffmpeg 命令直接读缓存，避免每个 ffmpeg 子进程重复探测源文件
+    # 扫描阶段一次性预解析全部待渲染源素材（分辨率/编码/采样率/通道）写入内存缓存，
+    # 后续构建 ffmpeg 命令直接读缓存；已续跑跳过的组无需探测，省掉无谓 IO
     sources = [
         path
         for episode in episodes
         for group in episode["groups"]
+        if not group["resumed"]
         for path in (group.get("videoPath"), group.get("audioPath"))
         if path
     ]
@@ -202,4 +242,56 @@ def scan_episodes(root_dir: str | Path) -> dict[str, Any]:
     except Exception:  # 探测失败不影响扫描结果，仅失去缓存加速
         pass
 
-    return {"root": str(root), "total": len(episodes), "episodes": episodes}
+    return {
+        "index": index,
+        "name": root.name,
+        "root": str(root),
+        "episodes": episodes,
+        "warnings": warnings,
+        "taskTotal": sum(len(episode["groups"]) for episode in episodes),
+        "taskPending": sum(episode["pendingCount"] for episode in episodes),
+        "taskResumed": sum(episode["resumedCount"] for episode in episodes),
+    }
+
+
+def scan_projects(project_dirs: list[str | Path]) -> dict[str, Any]:
+    """批量扫描多个一级项目根目录
+
+    project_dirs: 一级项目根目录列表（每个元素 = 一个项目）
+    返回：
+      projects  各项目扫描结果（结构见 scan_project）
+      summary   全局汇总：项目数 / 分集数 / 有效分集数 / 素材组总数 / 待渲染数 / 续跑跳过数
+    """
+    roots = [str(item).strip() for item in (project_dirs or []) if str(item or "").strip()]
+    if not roots:
+        raise NotADirectoryError("未指定任何项目根目录，请先添加一级项目文件夹")
+
+    projects = [scan_project(root, index=i) for i, root in enumerate(roots, start=1)]
+    episodes = [episode for project in projects for episode in project["episodes"]]
+
+    return {
+        "projects": projects,
+        "summary": {
+            "projectTotal": len(projects),
+            "episodeTotal": len(episodes),
+            "validEpisodeTotal": sum(1 for episode in episodes if episode["groups"]),
+            "groupTotal": sum(len(episode["groups"]) for episode in episodes),
+            "groupPendingTotal": sum(episode["pendingCount"] for episode in episodes),
+            # 断点续跑：已存在成品而跳过的组数
+            "groupResumedTotal": sum(episode["resumedCount"] for episode in episodes),
+            "videoTotal": sum(episode["videoCount"] for episode in episodes),
+        },
+    }
+
+
+def scan_episodes(root_dir: str | Path) -> dict[str, Any]:
+    """单项目扫描（保留旧入口，返回 {"root","total","episodes"}）
+
+    内部复用 scan_project，episodes 结构为带 outputPath/resumed 的超集，旧字段全部保留。
+    """
+    project = scan_project(root_dir)
+    return {
+        "root": project["root"],
+        "total": len(project["episodes"]),
+        "episodes": project["episodes"],
+    }

@@ -10,9 +10,15 @@
       <!-- ================= 0. 全局统计栏 + 分集明细 ================= -->
       <el-card shadow="never" class="panel">
         <div class="global-stats">
+          <span class="stat-item">一级项目：<b>{{ scanSummary.projectTotal }}</b> 个</span>
+          <span class="stat-divider">|</span>
           <span class="stat-item">有效分集：<b>{{ scanSummary.validEpisodeTotal }}</b> 个</span>
           <span class="stat-divider">|</span>
-          <span class="stat-item">配音文件：<b>{{ scanSummary.audioTotal }}</b> 个</span>
+          <span class="stat-item">素材组：<b>{{ scanSummary.audioTotal }}</b> 组</span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">待渲染：<b>{{ scanSummary.groupPendingTotal }}</b> 组</span>
+          <span class="stat-divider">|</span>
+          <span class="stat-item">续跑跳过：<b>{{ scanSummary.groupResumedTotal }}</b> 组</span>
           <span class="stat-divider">|</span>
           <span class="stat-item">视频素材：<b>{{ scanSummary.videoTotal }}</b> 个</span>
           <span class="stat-divider">|</span>
@@ -35,9 +41,11 @@
           max-height="280"
         >
           <el-table-column type="index" label="#" width="52" align="center" />
+          <el-table-column prop="projectName" label="项目" width="120" show-overflow-tooltip />
           <el-table-column prop="name" label="分集目录" min-width="170" show-overflow-tooltip />
-          <el-table-column prop="audioCount" label="音频" width="76" align="center" />
+          <el-table-column prop="audioCount" label="素材组" width="80" align="center" />
           <el-table-column prop="videoCount" label="视频" width="76" align="center" />
+          <el-table-column prop="resumedCount" label="续跑" width="70" align="center" />
           <el-table-column label="分集进度" min-width="170">
             <template #default="{ row }">
               <el-progress
@@ -90,23 +98,98 @@
         </div>
       </el-card>
 
-      <!-- ================= 2. 处理来源 ================= -->
+      <!-- ================= 2. 处理来源（批量一级项目列表） ================= -->
       <el-card shadow="never" class="panel">
         <template #header><span class="panel-title">处理来源</span></template>
         <div class="row-inline">
-          <el-input
-            v-model="form.sourceDir"
-            placeholder="请选择分集根目录（一个子文件夹 = 一集）"
-            clearable
-            style="flex: 1"
-          />
-          <el-button type="primary" plain @click="handleBrowseSource">浏览</el-button>
-          <el-button type="success" :loading="scanning" @click="handleScan">扫描目录</el-button>
+          <el-button type="primary" plain @click="handleBrowseSource">添加项目文件夹</el-button>
+          <el-button type="success" :loading="scanning" :disabled="!form.sources.length" @click="handleScan">
+            扫描目录
+          </el-button>
+          <span class="value-text">
+            新增：一级文件夹 = 项目根目录，其下子文件夹 = 分集；分集内需同时存在【视频】【音频】两个文件夹
+          </span>
         </div>
+
+        <!-- 项目列表：每个项目一份「合并视频 / 加原片头」勾选（默认均取消勾选），并支持项目级暂停/取消 -->
+        <div class="episode-list" v-if="form.sources.length">
+          <div class="list-head">
+            <span>一级项目列表</span>
+            <el-tag type="info" effect="plain">共 {{ form.sources.length }} 个项目</el-tag>
+          </div>
+          <el-table :data="form.sources" size="small" border stripe max-height="220">
+            <el-table-column type="index" label="#" width="52" align="center" />
+            <el-table-column label="项目根目录" min-width="320" show-overflow-tooltip>
+              <template #default="{ row }">
+                <div>{{ row.root }}</div>
+                <!-- 任务运行中：显示该项目进度与暂停/取消状态 -->
+                <div class="file-cell" v-if="projectRuntime[row.index]">
+                  进度 {{ projectRuntime[row.index].done }} / {{ projectRuntime[row.index].total }} 组
+                  <el-tag v-if="projectRuntime[row.index].canceled" type="info" size="small" effect="plain">已取消</el-tag>
+                  <el-tag v-else-if="projectRuntime[row.index].paused" type="warning" size="small" effect="plain">已暂停</el-tag>
+                  <el-tag v-else-if="projectRuntime[row.index].merged" type="success" size="small" effect="plain">已合并</el-tag>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="创建合并视频" width="120" align="center">
+              <template #default="{ row }">
+                <el-checkbox v-model="row.mergeVideo" />
+              </template>
+            </el-table-column>
+            <el-table-column label="合并原视频与第一集" width="160" align="center">
+              <template #default="{ row }">
+                <el-checkbox v-model="row.mergeWithFirst" :disabled="!row.mergeVideo" />
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="250" align="center">
+              <template #default="{ row }">
+                <template v-if="isTaskRunning && projectRuntime[row.index]">
+                  <el-button
+                    link
+                    type="warning"
+                    size="small"
+                    :disabled="projectRuntime[row.index].canceled"
+                    @click="handleTogglePauseProject(row)"
+                  >
+                    {{ projectRuntime[row.index].paused ? '恢复' : '暂停' }}
+                  </el-button>
+                  <el-button
+                    link
+                    type="danger"
+                    size="small"
+                    :disabled="projectRuntime[row.index].canceled"
+                    @click="handleCancelProject(row)"
+                  >
+                    取消本项目
+                  </el-button>
+                </template>
+                <el-button
+                  link
+                  type="primary"
+                  size="small"
+                  :disabled="isTaskRunning"
+                  @click="handleRemoveSource(row)"
+                >
+                  移除
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="hint-text">
+            合并按项目独立控制：某项目勾选就只合并该项目；合并成片输出到该项目的【一级项目根目录】下的「合并视频.mp4」。
+            仅当该项目全部分集渲染结束后才会执行合并，且全局同一时间只运行 1 个合并任务。
+          </div>
+        </div>
+        <el-empty v-else description="尚未添加项目，请点击「添加项目文件夹」" :image-size="70" />
 
         <!-- 扫描状态提示 -->
         <div class="scan-status" v-if="scanStatus">
           <el-alert :title="scanStatus" :type="scanStatusType" :closable="false" show-icon />
+        </div>
+
+        <!-- 项目级告警（如某个二级分集缺【视频】/【音频】文件夹，整集跳过） -->
+        <div class="scan-status" v-for="(item, i) in projectWarnings" :key="i">
+          <el-alert :title="`[项目${item.projectName}] ${item.text}`" type="warning" :closable="false" show-icon />
         </div>
 
         <!-- 分集清单 -->
@@ -117,7 +200,8 @@
           </div>
           <el-table :data="episodes" size="small" border stripe height="240">
             <el-table-column type="index" label="#" width="52" align="center" />
-            <el-table-column prop="name" label="分集目录" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="projectName" label="项目" width="120" show-overflow-tooltip />
+            <el-table-column prop="name" label="分集目录" min-width="160" show-overflow-tooltip />
             <el-table-column label="视频" width="90" align="center">
               <template #default="{ row }">
                 <el-tag :type="row.videoPath ? 'success' : 'danger'" size="small" effect="plain">
@@ -227,8 +311,10 @@
       <el-card shadow="never" class="panel">
         <template #header><span class="panel-title">输出选项</span></template>
         <div class="row-inline">
-          <el-checkbox v-model="form.mergeVideo">创建合并视频</el-checkbox>
-          <el-checkbox v-model="form.mergeWithFirst" :disabled="!form.mergeVideo">合并原视频与第一集</el-checkbox>
+          <span class="field-label">输出位置</span>
+          <span class="value-text">
+            每个分集的成品 → 该分集内的【处理完成】文件夹；合并成片 → 一级项目根目录下的「合并视频.mp4」
+          </span>
         </div>
         <div class="row-inline mt8">
           <span class="field-label">自定义分辨率</span>
@@ -273,17 +359,40 @@
         </div>
       </el-card>
 
-      <!-- ================= 6. 性能限制 ================= -->
+      <!-- ================= 6. 性能设置 ================= -->
       <el-card shadow="never" class="panel">
-        <template #header><span class="panel-title">性能限制</span></template>
+        <template #header><span class="panel-title">性能设置</span></template>
+        <!-- 调度模式二选一：高性能多任务（多核+独显） / 低配单任务串行（6核16G） -->
         <div class="row-inline">
-          <el-checkbox v-model="form.parallelEnabled">启用并行处理</el-checkbox>
+          <span class="field-label">调度模式</span>
+          <el-select v-model="form.scheduleMode" style="width: 260px">
+            <el-option label="高性能多任务模式（多核 CPU + 独显）" value="multi" />
+            <el-option label="低配单任务串行模式（普通 6 核 / 16G 内存）" value="serial" />
+          </el-select>
+          <span class="field-label ml16">调度策略</span>
+          <el-select
+            v-model="form.schedulePolicy"
+            style="width: 180px"
+            :disabled="form.scheduleMode === 'serial'"
+          >
+            <el-option label="项目优先（优先出片）" value="project_first" />
+            <el-option label="均分任务（齐头并进）" value="even" />
+          </el-select>
+        </div>
+        <div class="hint-text">
+          高性能多任务模式：字幕/音频预处理多任务并发；硬件编码（NVENC/QSV/AMF）任务串行排队，同一时刻只跑 1 个硬件编码进程，CPU 软编码任务不受闸门限制。适合一次性放入 2 套独立 9 小时项目并发处理。
+        </div>
+        <div class="hint-text">
+          低配单任务串行模式：同一时刻只允许运行 1 个 ffmpeg 渲染任务，任务排队串行执行；调度固定「项目优先」，完整跑完当前项目再自动处理队列中的下一个项目。编码参数固定 libx264 / preset=veryfast / CRF=24（约 60 分钟输出 1 条 9 小时 1080p 全字幕成片），资源占用平稳，不易触发限流。
+        </div>
+        <div class="row-inline mt8">
+          <el-checkbox v-model="form.parallelEnabled" :disabled="form.scheduleMode === 'serial'">启用并行处理</el-checkbox>
           <span class="field-label ml16">最大任务数（线程池并发）</span>
           <el-input-number
             v-model="form.maxWorkers"
             :min="1"
             :max="32"
-            :disabled="!form.parallelEnabled"
+            :disabled="form.scheduleMode === 'serial' || !form.parallelEnabled"
             controls-position="right"
             style="width: 130px"
           />
@@ -482,8 +591,9 @@ const CPU_CORES = navigator.hardwareConcurrency || 4
 const DEFAULT_MAX_WORKERS = Math.max(1, Math.floor(CPU_CORES / 2))
 
 const form = reactive({
-  // 处理来源
-  sourceDir: '',
+  // 处理来源：批量一级项目列表。每项 = { root, mergeVideo, mergeWithFirst }
+  // mergeVideo/mergeWithFirst 为「按项目独立控制」的合并勾选，默认均取消勾选（false）
+  sources: [],
   // BGM
   bgmEnabled: false,
   bgmMode: 'single_loop',
@@ -503,16 +613,19 @@ const form = reactive({
   // 只加载这一个字体，省掉字体查找耗时并避免字体缺失导致的渲染异常；字体目录留空即为默认策略
   fontFile: 'C:\\Windows\\Fonts\\msyh.ttc',
   fontsDir: '',
-  // 输出选项
-  mergeVideo: true,
-  mergeWithFirst: false,
-  width: 1280,
-  height: 720,
+  // 输出选项（合并开关已移到「处理来源」的项目列表内，按项目独立控制，默认取消勾选）
+  // 默认输出 1080p（典型场景：9 小时全程字幕，字幕渲染压力大）
+  width: 1920,
+  height: 1080,
   bitrate: 2000,
   preset: 'fast',   // h.264 编码预设
   crf: 0,           // 软编码=CRF / 硬件编码=CQ；>0 时以恒定质量编码
   engine: 'auto',   // 编码引擎：auto / cpu / nvenc / qsv / amf
-  // 性能限制
+  // 性能设置
+  // 调度模式：multi 高性能多任务（原有，多核 + 独显） / serial 低配单任务串行（新增，6核16G）
+  scheduleMode: 'multi',
+  // 调度策略：project_first 项目优先 / even 均分任务（串行模式下固定项目优先，页面置灰）
+  schedulePolicy: 'project_first',
   parallelEnabled: true,
   maxWorkers: DEFAULT_MAX_WORKERS,
   perfLimit: 80,
@@ -535,15 +648,29 @@ const scanning = ref(false)
 const scanStatus = ref('')
 const scanStatusType = ref('info')
 const episodes = ref([])
+// 项目级告警（如某个二级分集缺【视频】/【音频】文件夹，整集跳过）
+const projectWarnings = ref([])
 
-// ---------- 全局统计栏 / 分集明细（扫描接口新增返回的 summary + detail） ----------
+// ---------- 全局统计栏 / 分集明细（扫描接口返回的 summary + detail） ----------
 const scanSummary = ref({
+  projectTotal: 0,          // 一级项目数
   episodeTotal: 0,
   validEpisodeTotal: 0,
-  audioTotal: 0,
+  audioTotal: 0,            // 合格素材组总数（mp4+mp3+srt 同名）
+  groupPendingTotal: 0,     // 待渲染组数
+  groupResumedTotal: 0,     // 断点续跑：成品已存在而跳过的组数
   videoTotal: 0
 })
 const episodeDetail = ref([])
+
+// ---------- 项目级运行态（progress 接口返回的 projects，驱动项目行的暂停/恢复/取消按钮） ----------
+const projectStates = ref([])
+// index → 项目运行态；未开始渲染时为空，按钮区不展示控制项
+const projectRuntime = computed(() => {
+  const map = {}
+  for (const item of projectStates.value) map[item.index] = item
+  return map
+})
 // 全局总进度（按「有效素材组」计）：已完成组数 / 总组数
 const groupProgress = ref({ done: 0, total: 0 })
 // 当前阶段：ready 准备就绪 / running 处理中 / completed 全部完成 / partial 部分失败
@@ -645,9 +772,11 @@ const positionLabel = computed(() => {
 })
 
 const footerTip = computed(() => {
-  if (!form.sourceDir) return '请先选择处理来源根目录'
+  if (!form.sources.length) return '请先添加一级项目根目录'
   if (!episodes.value.length) return '请先扫描目录，确认分集清单'
-  return `共 ${episodes.value.length} 集待合成`
+  const mergeCount = form.sources.filter((s) => s.mergeVideo).length
+  const mergeTip = mergeCount ? `（${mergeCount} 个项目将执行合并）` : '（未勾选合并）'
+  return `共 ${form.sources.length} 个项目 / ${episodes.value.length} 集待合成 ${mergeTip}`
 })
 
 // 当前阶段文案 / 标签色（统计栏第 4 项）
@@ -700,8 +829,14 @@ const globalProgressStatus = computed(() => {
 })
 
 // ---------- 分集行：进度 / 状态 ----------
-const EPISODE_STATUS_TEXT = { pending: '待处理', running: '渲染中', success: '成功', failed: '失败' }
-const EPISODE_STATUS_COLOR = { pending: '#909399', running: '#409eff', success: '#67c23a', failed: '#f56c6c' }
+const EPISODE_STATUS_TEXT = { pending: '待处理', running: '渲染中', success: '成功', failed: '失败', canceled: '已取消' }
+const EPISODE_STATUS_COLOR = {
+  pending: '#909399',
+  running: '#409eff',
+  success: '#67c23a',
+  failed: '#f56c6c',
+  canceled: '#e6a23c'
+}
 
 function rowStatusLabel(status) {
   return EPISODE_STATUS_TEXT[status] || EPISODE_STATUS_TEXT.pending
@@ -714,15 +849,17 @@ function rowStatusColor(status) {
 function rowProgressStatus(row) {
   if (row.status === 'success') return 'success'
   if (row.status === 'failed') return 'exception'
+  if (row.status === 'canceled') return 'warning'
   return undefined
 }
 
 // 把轮询到的分集运行态合并进明细行（保留扫描得到的静态字段）
+// 注意：多项目并存时各项目分集序号会重复，必须用「项目-分集」复合键 key 匹配
 function applyEpisodeProgress(rows) {
   if (!rows || !rows.length) return
-  const runtimeMap = new Map(rows.map((item) => [item.index, item]))
+  const runtimeMap = new Map(rows.map((item) => [item.key, item]))
   episodeDetail.value = episodeDetail.value.map((row) => {
-    const runtime = runtimeMap.get(row.index)
+    const runtime = runtimeMap.get(row.key)
     if (!runtime) return row
     return {
       ...row,
@@ -759,6 +896,11 @@ function handlePresetChange(id) {
       if (cfg[key] !== undefined) form[key] = cfg[key]
     })
     if (cfg.subtitleStyle) Object.assign(form.subtitleStyle, cfg.subtitleStyle)
+    // 预设可能带项目列表：重建序号并清空旧扫描结果（项目列表变化后扫描数据必然失效）
+    if (Array.isArray(cfg.sources)) {
+      reindexSources()
+      resetScanResult()
+    }
     ElMessage.success(`已应用预设：${preset.name}`)
   } catch {
     ElMessage.error('预设内容解析失败')
@@ -818,70 +960,166 @@ async function ensureBackendReady() {
   return true
 }
 
-// 浏览选择根目录（调用 Electron 原生对话框）
-async function handleBrowseSource() {
-  const selected = await window.electronAPI?.selectFolder?.()
-  if (selected) {
-    form.sourceDir = selected
-    // 目录变化后清空旧的分集清单与统计栏数据
-    episodes.value = []
-    scanStatus.value = ''
-    scanSummary.value = { episodeTotal: 0, validEpisodeTotal: 0, audioTotal: 0, videoTotal: 0 }
-    episodeDetail.value = []
-    groupProgress.value = { done: 0, total: 0 }
-    composeStage.value = 'ready'
-    // 目录变更：计时归零，允许新任务结束弹窗
-    elapsedSeconds.value = 0
-    durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
-    completionDialog.value = false
-    completionNotifiedId.value = null
+// 清空扫描结果与任务展示态（项目列表变更后调用，避免残留旧数据）
+function resetScanResult() {
+  episodes.value = []
+  scanStatus.value = ''
+  projectWarnings.value = []
+  scanSummary.value = {
+    projectTotal: 0,
+    episodeTotal: 0,
+    validEpisodeTotal: 0,
+    audioTotal: 0,
+    groupPendingTotal: 0,
+    groupResumedTotal: 0,
+    videoTotal: 0
   }
+  episodeDetail.value = []
+  projectStates.value = []
+  groupProgress.value = { done: 0, total: 0 }
+  composeStage.value = 'ready'
+  // 目录变更：计时归零，允许新任务结束弹窗
+  elapsedSeconds.value = 0
+  durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
+  completionDialog.value = false
+  completionNotifiedId.value = null
 }
 
-// 扫描目录：一个一级子文件夹 = 一个分集
+// 重新编号项目序号：后端按「列表顺序」定项目序号，移除项目后必须同步，
+// 保证页面 row.index 与后端 projects[].index 一一对应（项目级暂停/取消按钮依赖它）
+function reindexSources() {
+  form.sources.forEach((item, i) => {
+    item.index = i + 1
+  })
+}
+
+// 添加一级项目根目录（列表式逐个追加，已存在的项目不重复添加）
+async function handleBrowseSource() {
+  const selected = await window.electronAPI?.selectFolder?.()
+  if (!selected) return
+  if (form.sources.some((item) => item.root === selected)) {
+    ElMessage.warning('该项目已在列表中')
+    return
+  }
+  form.sources.push({ index: form.sources.length + 1, root: selected, mergeVideo: false, mergeWithFirst: false })
+  reindexSources()
+  resetScanResult()
+}
+
+// 从列表移除一个项目（任务运行中禁止移除，避免与后端项目序号错位）
+function handleRemoveSource(row) {
+  const position = form.sources.indexOf(row)
+  if (position < 0) return
+  form.sources.splice(position, 1)
+  reindexSources()
+  resetScanResult()
+}
+
+// 扫描全部项目目录（批量）：返回各项目/分集/素材组与断点续跑跳过信息
 async function handleScan() {
-  if (!form.sourceDir) {
-    ElMessage.warning('请先选择分集根目录')
+  if (!form.sources.length) {
+    ElMessage.warning('请先添加一级项目根目录')
     return
   }
   if (!(await ensureBackendReady())) return
   scanning.value = true
   scanStatus.value = '正在扫描目录…'
   scanStatusType.value = 'info'
+  projectWarnings.value = []
   try {
-    const res = await api.scanFolder(form.sourceDir)
-    episodes.value = res?.episodes || []
-    // 统计栏 + 分集明细（兼容旧后端：缺少 summary/detail 时按已有字段退化计算）
+    const res = await api.scanFolders(form.sources.map((item) => item.root))
+    const projects = res?.projects || []
+    // 分集清单：从各项目内取分集（带第一组有效素材路径，供「匹配文件」列展示）
+    episodes.value = projects.flatMap((project) =>
+      (project.episodes || []).map((episode) => ({
+        ...episode,
+        key: `${project.index}-${episode.index}`,
+        projectIndex: project.index,
+        projectName: project.name
+      }))
+    )
+    // 统计栏 + 分集明细（detail 一行为一个二级分集）
     episodeDetail.value = (res?.detail || []).map((item) => ({
       ...item,
       progress: 0,
       status: 'pending'
     }))
-    scanSummary.value = res?.summary || {
-      episodeTotal: episodes.value.length,
-      validEpisodeTotal: episodes.value.filter((ep) => (ep.groups || []).length).length,
-      audioTotal: episodes.value.reduce((sum, ep) => sum + (ep.groups || []).length, 0),
-      videoTotal: episodes.value.reduce((sum, ep) => sum + (ep.videoCount || 0), 0)
+    projectWarnings.value = res?.projectWarnings || []
+    const summary = res?.summary || {}
+    scanSummary.value = {
+      projectTotal: summary.projectTotal ?? projects.length,
+      episodeTotal: summary.episodeTotal ?? episodes.value.length,
+      validEpisodeTotal:
+        summary.validEpisodeTotal ?? episodes.value.filter((ep) => (ep.groups || []).length).length,
+      // audioTotal 为「合格素材组总数」的兼容字段名
+      audioTotal: summary.audioTotal ?? summary.groupTotal ?? 0,
+      groupPendingTotal: summary.groupPendingTotal ?? 0,
+      groupResumedTotal: summary.groupResumedTotal ?? 0,
+      videoTotal: summary.videoTotal ?? 0
     }
     // 新一轮扫描：全局进度归零，总组数 = 全部有效素材组数
     groupProgress.value = { done: 0, total: scanSummary.value.audioTotal }
     // 扫描完成且尚未开始渲染 → 准备就绪；计时归零，允许下次任务结束弹窗
     composeStage.value = 'ready'
+    projectStates.value = []
     elapsedSeconds.value = 0
     durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
     completionDialog.value = false
     completionNotifiedId.value = null
-    scanStatus.value = `扫描完成：共 ${res?.total ?? episodes.value.length} 集`
+    scanStatus.value =
+      `扫描完成：共 ${scanSummary.value.projectTotal} 个项目 / ${scanSummary.value.validEpisodeTotal} 个有效分集 / ` +
+      `${scanSummary.value.audioTotal} 组合格素材（待渲染 ${scanSummary.value.groupPendingTotal} 组，` +
+      `续跑跳过 ${scanSummary.value.groupResumedTotal} 组）`
     scanStatusType.value = 'success'
   } catch (e) {
-    episodes.value = []
-    scanSummary.value = { episodeTotal: 0, validEpisodeTotal: 0, audioTotal: 0, videoTotal: 0 }
-    episodeDetail.value = []
-    groupProgress.value = { done: 0, total: 0 }
+    resetScanResult()
     scanStatus.value = `扫描失败：${e.message}（需先启动后端服务）`
     scanStatusType.value = 'error'
   } finally {
     scanning.value = false
+  }
+}
+
+// ---------- 2.1 项目级控制：单独暂停/恢复/取消某一个一级项目 ----------
+// 暂停：该项目未开始的素材组暂不提交，已开始的渲染跑完；恢复后继续跑剩余组
+async function handleTogglePauseProject(row) {
+  if (!task.value?.id) return
+  const runtime = projectRuntime.value[row.index]
+  if (!runtime) return
+  try {
+    if (runtime.paused) {
+      await api.resumeProject(task.value.id, row.index)
+      ElMessage.success(`项目${runtime.name} 已恢复`)
+    } else {
+      await api.pauseProject(task.value.id, row.index)
+      ElMessage.success(`项目${runtime.name} 已暂停`)
+    }
+    await refreshTask()
+  } catch (e) {
+    ElMessage.error(`项目控制失败：${e.message}`)
+  }
+}
+
+// 取消：终止该项目所有未完成任务（在跑的 ffmpeg 立即强杀），不影响其他项目
+async function handleCancelProject(row) {
+  if (!task.value?.id) return
+  const runtime = projectRuntime.value[row.index]
+  if (!runtime) return
+  try {
+    await ElMessageBox.confirm(
+      `确定取消项目「${runtime.name}」？该项目未完成的分集任务将被终止（其他项目不受影响）`,
+      '提示',
+      { type: 'warning' }
+    )
+  } catch {
+    return // 用户取消
+  }
+  try {
+    await api.cancelProject(task.value.id, row.index)
+    ElMessage.success(`项目${runtime.name} 已取消`)
+    await refreshTask()
+  } catch (e) {
+    ElMessage.error(`取消项目失败：${e.message}`)
   }
 }
 
@@ -904,8 +1142,16 @@ function handleConfirmSubtitleStyle() {
 
 // ---------- 5. 开始合成 ----------
 function buildPayload() {
+  const roots = form.sources.map((item) => item.root)
   return {
-    sourceDir: form.sourceDir,
+    // 项目列表：每项自带合并勾选 → 后端按项目独立控制合并（A 勾选只合并 A）
+    projects: form.sources.map((item) => ({
+      root: item.root,
+      mergeVideo: !!item.mergeVideo,
+      // 未勾选「创建合并视频」时不加片头
+      mergeWithFirst: !!(item.mergeVideo && item.mergeWithFirst)
+    })),
+    sourceDirs: roots,
     bgm: {
       enabled: form.bgmEnabled,
       mode: form.bgmMode,
@@ -919,8 +1165,6 @@ function buildPayload() {
       fontsDir: form.fontsDir
     },
     output: {
-      mergeVideo: form.mergeVideo,
-      mergeWithFirst: form.mergeWithFirst,
       width: form.width,
       height: form.height,
       bitrate: form.bitrate,
@@ -929,6 +1173,10 @@ function buildPayload() {
       engine: form.engine
     },
     performance: {
+      // 双调度模式：multi 高性能多任务 / serial 低配单任务串行
+      scheduleMode: form.scheduleMode,
+      // 串行模式下后端固定为项目优先（此处同步，避免前后端语义不一致）
+      schedulePolicy: form.scheduleMode === 'serial' ? 'project_first' : form.schedulePolicy,
       parallelEnabled: form.parallelEnabled,
       maxWorkers: form.maxWorkers,
       perfLimit: form.perfLimit,
@@ -941,8 +1189,12 @@ function buildPayload() {
 }
 
 async function handleStartCompose() {
-  if (!form.sourceDir) {
-    ElMessage.warning('请先选择处理来源根目录')
+  if (!form.sources.length) {
+    ElMessage.warning('请先添加一级项目根目录')
+    return
+  }
+  if (!episodes.value.length) {
+    ElMessage.warning('请先扫描目录，确认分集清单')
     return
   }
   if (form.bgmEnabled && !form.bgmFile) {
@@ -966,6 +1218,7 @@ async function handleStartCompose() {
     // 已开始渲染 → 处理中；进度归零重新计（总组数沿用扫描到的有效素材组数）
     composeStage.value = 'running'
     groupProgress.value = { done: 0, total: groupProgress.value.total }
+    projectStates.value = []
     // 计时起点 = 后端记录的任务起始时间戳；新任务允许再次弹窗
     elapsedSeconds.value = res?.elapsedSeconds ?? 0
     durationStats.value = { renderText: '00:00:00', queueText: '00:00:00' }
@@ -1020,6 +1273,8 @@ async function refreshTask() {
     task.value = { ...task.value, ...res }
     // 全局总进度：已完成渲染的素材组数 / 全部有效素材组数
     groupProgress.value = { done: res.doneGroups ?? 0, total: res.totalGroups ?? 0 }
+    // 项目级运行态：驱动项目列表行的进度、暂停/恢复与取消按钮
+    projectStates.value = res.projects || []
     // 已运行时长：以后端起始时间戳推导的秒数为准，随轮询实时刷新
     elapsedSeconds.value = res.elapsedSeconds ?? elapsedSeconds.value
     // 双时长：FFmpeg 实际渲染总时长（进度统计口径）/ 排队等待总时长

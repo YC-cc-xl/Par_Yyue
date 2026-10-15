@@ -42,7 +42,10 @@ async function request(path, { method = 'GET', body } = {}) {
 }
 
 export const api = {
-  // 扫描根目录，返回分集清单与总数
+  // 扫描一级项目根目录（支持批量）：返回各项目/分集/素材组与续跑跳过信息
+  scanFolders: (sourceDirs) =>
+    request('/api/compose/scan', { method: 'POST', body: { sourceDirs } }),
+  // 兼容旧调用：单个根目录
   scanFolder: (sourceDir) => request('/api/compose/scan', { method: 'POST', body: { sourceDir } }),
 
   // 参数预设
@@ -53,10 +56,18 @@ export const api = {
   // 批量合成任务
   createTask: (payload) => request('/api/compose/tasks', { method: 'POST', body: payload }),
   getTask: (id) => request(`/api/compose/tasks/${id}`),
-  // 任务进度：全局进度（已完成组/总组）+ 各分集独立进度与状态，供前端轮询刷新
+  // 任务进度：全局进度（已完成组/总组）+ 各分集/各项目独立进度与状态，供前端轮询刷新
   getTaskProgress: (id) => request(`/api/compose/tasks/${id}/progress`),
-  // 手动取消任务：计时停止，终态 canceled，不触发完成弹窗
+  // 手动取消任务（整单）：计时停止，终态 canceled，不触发完成弹窗
   cancelTask: (id) => request(`/api/compose/tasks/${id}/cancel`, { method: 'POST' }),
+
+  // 项目级控制：单独暂停/恢复/取消某一个一级项目，不影响其他项目
+  pauseProject: (id, projectIndex) =>
+    request(`/api/compose/tasks/${id}/projects/${projectIndex}/pause`, { method: 'POST' }),
+  resumeProject: (id, projectIndex) =>
+    request(`/api/compose/tasks/${id}/projects/${projectIndex}/resume`, { method: 'POST' }),
+  cancelProject: (id, projectIndex) =>
+    request(`/api/compose/tasks/${id}/projects/${projectIndex}/cancel`, { method: 'POST' }),
 
   // 实时系统资源：CPU 占用 / 磁盘读写 / 是否饱和（供资源监控面板轮询）
   getSystemResources: () => request('/api/system/resources')
