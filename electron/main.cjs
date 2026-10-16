@@ -2,7 +2,7 @@
 // 阶段1：创建窗口
 // 阶段2：新增文件夹/文件选择对话框 IPC（供页面「浏览」按钮调用）
 // 阶段7：自动拉起 / 退出时杀死 Python(FastAPI) 后端进程
-const { app, BrowserWindow, ipcMain, dialog } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, clipboard } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const http = require('node:http')
@@ -294,6 +294,97 @@ ipcMain.handle('backend:get-status', () => ({
   error: backendError,
   tail: logTail.slice(-10)
 }))
+
+// ============ IPC：文本处理（本地文件读写 / 剪贴板，纯离线）============
+
+// 文本文件对话框过滤器：默认只看 txt/md/log，另给「所有文件」兜底
+const TEXT_FILE_FILTERS = [
+  { name: '文本文件', extensions: ['txt', 'md', 'log'] },
+  { name: '所有文件', extensions: ['*'] }
+]
+
+/**
+ * 解码文本字节流：自动兼容 utf-8 / gbk / gb18030
+ * 流程：先剥掉 UTF-8 BOM（EF BB BF），再用 fatal 模式逐个编码尝试；
+ *      全部失败返回 null（由调用方转成结构化错误，不让异常抛到渲染进程）
+ */
+function decodeTextBuffer(buffer) {
+  let data = buffer
+  if (data.length >= 3 && data[0] === 0xef && data[1] === 0xbb && data[2] === 0xbf) {
+    data = data.subarray(3)
+  }
+  for (const encoding of ['utf-8', 'gbk', 'gb18030']) {
+    try {
+      return { content: new TextDecoder(encoding, { fatal: true }).decode(data), encoding }
+    } catch {
+      // 该编码解不出来，继续尝试下一种
+    }
+  }
+  return null
+}
+
+// 打开 / 读取文本文件：
+//   带 path 时直接读取（供「重新加载」用，不弹对话框）
+//   不带 path 时弹系统打开对话框
+// 返回 { path, content, encoding }；取消返回 null；失败返回 { error }
+ipcMain.handle('file:read-text', async (_event, payload = {}) => {
+  let target = payload && payload.path ? String(payload.path) : ''
+  if (!target) {
+    const result = await dialog.showOpenDialog(mainWindow || undefined, {
+      title: '打开文本文件',
+      properties: ['openFile'],
+      filters: TEXT_FILE_FILTERS
+    })
+    if (result.canceled || result.filePaths.length === 0) return null
+    target = result.filePaths[0]
+  }
+  try {
+    const buffer = fs.readFileSync(target)
+    const decoded = decodeTextBuffer(buffer)
+    if (!decoded) return { path: target, error: 'unsupported-encoding' }
+    return { path: target, content: decoded.content, encoding: decoded.encoding }
+  } catch (e) {
+    // 文件不存在/被占用/无权限等：返回结构化错误，前端弹友好提示
+    return { path: target, error: 'read-failed', message: String((e && e.message) || e) }
+  }
+})
+
+// 保存 / 另存为文本文件：
+//   askPath 为真（或没有已知路径）时弹保存对话框；统一写为 UTF-8（无 BOM）
+// 返回 { path }；取消返回 null；失败返回 { error }
+ipcMain.handle('file:write-text', async (_event, payload = {}) => {
+  let target = payload && payload.path ? String(payload.path) : ''
+  const content = typeof (payload && payload.content) === 'string' ? payload.content : ''
+  if (payload && payload.askPath) {
+    const result = await dialog.showSaveDialog(mainWindow || undefined, {
+      title: '保存文本文件',
+      defaultPath: target || '新建文本.txt',
+      filters: TEXT_FILE_FILTERS
+    })
+    if (result.canceled || !result.filePath) return null
+    target = result.filePath
+  }
+  if (!target) return null
+  try {
+    fs.writeFileSync(target, content, 'utf8')
+    return { path: target }
+  } catch (e) {
+    return { path: target, error: 'write-failed', message: String((e && e.message) || e) }
+  }
+})
+
+// 写入系统剪贴板：
+// 生产环境页面是 file://（非安全上下文），渲染进程 navigator.clipboard 不可用，
+// 因此统一走主进程 clipboard 模块
+ipcMain.handle('clipboard:write-text', (_event, payload = {}) => {
+  try {
+    const text = typeof (payload && payload.text) === 'string' ? payload.text : ''
+    clipboard.writeText(text)
+    return { ok: true, length: text.length }
+  } catch (e) {
+    return { ok: false, reason: String((e && e.message) || e) }
+  }
+})
 
 app.whenReady().then(boot)
 

@@ -16,5 +16,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendPort: () => ipcRenderer.invoke('backend:get-port'),
 
   // 获取后端运行状态：{ ready, port, error, tail }
-  getBackendStatus: () => ipcRenderer.invoke('backend:get-status')
+  getBackendStatus: () => ipcRenderer.invoke('backend:get-status'),
+
+  // ===== 文本处理（本地文件与剪贴板，纯离线）=====
+
+  // 打开/读取文本文件：
+  //   不带 path 时弹系统打开对话框；带 path 时直接读取（供「重新加载」）
+  //   返回 { path, content, encoding } | null | { error }
+  readTextFile: (payload) => ipcRenderer.invoke('file:read-text', payload || {}),
+
+  // 保存/另存为文本文件：askPath 为真时弹保存对话框，统一写 UTF-8 无 BOM
+  //   返回 { path } | null | { error }
+  writeTextFile: (payload) => ipcRenderer.invoke('file:write-text', payload || {}),
+
+  // 写入系统剪贴板（file:// 下 navigator.clipboard 不可用，统一走主进程）
+  //   返回 { ok, length } | { ok: false, reason }
+  copyText: (text) => ipcRenderer.invoke('clipboard:write-text', { text })
 })

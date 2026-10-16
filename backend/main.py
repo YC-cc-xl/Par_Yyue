@@ -30,6 +30,10 @@ from pydantic import BaseModel, Field
 import models
 from scanner import scan_projects
 
+# 文本处理模块（本地离线：纯函数引擎 + 日志/后台任务/备份服务）；禁止与自动合成互相影响
+import text_process
+import text_service
+
 # 系统资源监控（零依赖 ctypes 实现）；不可用时接口返回「不支持」，不影响渲染流程
 try:
     import system_monitor
@@ -520,6 +524,150 @@ def project_cancel(task_id: int, project_index: int) -> dict:
         task_id, f"[项目#{project_index}] 已取消，该项目剩余任务将跳过", "WARN"
     )
     return {"success": True, "taskId": task_id, "projectIndex": project_index, "canceled": True}
+
+
+# ---------------------------------------------------------------------------
+# 文本处理（新增模块：本地离线执行，不联网、不调用任何外部大模型）
+#   长文本（超过文本异步阈值）自动转后台任务，接口立即返回 jobId，前端轮询查询进度
+# ---------------------------------------------------------------------------
+
+# 超过该字数时即便前端未显式要求，也自动转后台任务执行，避免长请求阻塞
+TEXT_ASYNC_THRESHOLD = 30000
+
+
+class TextCleanRequest(BaseModel):
+    """智能清理广告请求体"""
+    text: str = Field("", description="原始网文文本")
+    asyncJob: bool = Field(False, description="是否强制走后台任务")
+
+
+class TextFormatRequest(BaseModel):
+    """智能格式化请求体"""
+    text: str = Field("", description="待格式化文本")
+    dropChapter: bool = Field(False, description="格式化时是否删除章节名称行")
+    asyncJob: bool = Field(False, description="是否强制走后台任务")
+
+
+class TextSplitRequest(BaseModel):
+    """按字数剪切请求体"""
+    text: str = Field("", description="整篇文本")
+    size: int = Field(130000, ge=1, description="每段字数")
+
+
+class TextBackupRequest(BaseModel):
+    """备份请求体"""
+    text: str = Field("", description="要备份的文本")
+    note: str = Field("", description="备注（如来源文件路径）")
+
+
+def _require_text(text: str, action: str) -> str:
+    """文本非空校验：空文本直接 400，避免白跑一次长耗时处理"""
+    value = text or ""
+    if not value.strip():
+        raise HTTPException(status_code=400, detail=f"文本内容为空，无法{action}")
+    return value
+
+
+def _clean_worker(text: str) -> dict:
+    """后台任务：智能清理广告（结果结构供前端直接回填编辑器）"""
+    cleaned, stats = text_process.clean_ads(text)
+    return {"text": cleaned, "stats": stats}
+
+
+def _format_worker(text: str, drop_chapter: bool) -> dict:
+    """后台任务：智能格式化文本"""
+    formatted, stats = text_process.format_text(text, drop_chapter)
+    return {"text": formatted, "stats": stats}
+
+
+@app.post("/api/text/clean")
+def text_clean(req: TextCleanRequest) -> dict:
+    """智能清理广告：删广告行/装饰分隔符/HTML 残留，合并连续空行
+
+    返回 { async: false, text, stats }（短文本同步）或 { async: true, jobId }（长文本后台）。
+    """
+    text = _require_text(req.text, "清理广告")
+    if req.asyncJob or len(text) > TEXT_ASYNC_THRESHOLD:
+        job_id = text_service.submit_job("clean", lambda: _clean_worker(text))
+        return {"async": True, "jobId": job_id}
+    cleaned, stats = text_process.clean_ads(text)
+    text_service.append_text_log(f"智能清理广告完成：{len(text)} → {len(cleaned)} 字", "INFO")
+    return {"async": False, "text": cleaned, "stats": stats}
+
+
+@app.post("/api/text/format")
+def text_format(req: TextFormatRequest) -> dict:
+    """智能格式化文本：段落规整 → 标点修正 → 合并被错误换行切断的长句"""
+    text = _require_text(req.text, "格式化")
+    if req.asyncJob or len(text) > TEXT_ASYNC_THRESHOLD:
+        job_id = text_service.submit_job(
+            "format", lambda: _format_worker(text, req.dropChapter)
+        )
+        return {"async": True, "jobId": job_id}
+    formatted, stats = text_process.format_text(text, req.dropChapter)
+    text_service.append_text_log(
+        f"智能格式化文本完成（{'删除章节名' if req.dropChapter else '保留章节名'}）："
+        f"{len(text)} → {len(formatted)} 字",
+        "INFO",
+    )
+    return {"async": False, "text": formatted, "stats": stats}
+
+
+@app.post("/api/text/split")
+def text_split(req: TextSplitRequest) -> dict:
+    """按字数剪切分段：返回 { first, rest }，第一段用于复制到剪贴板，剩余留在编辑器"""
+    text = _require_text(req.text, "剪切")
+    try:
+        first, rest = text_process.split_by_length(text, req.size)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    text_service.append_text_log(
+        f"剪切分割：首段 {len(first)} 字，剩余 {len(rest)} 字（每段 {req.size} 字）", "INFO"
+    )
+    return {"first": first, "rest": rest, "size": req.size}
+
+
+@app.get("/api/text/jobs/{job_id}")
+def text_job(job_id: str) -> dict:
+    """查询后台文本任务：{ status, progress, message, result, error }"""
+    job = text_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="后台任务不存在或已过期")
+    return job
+
+
+@app.get("/api/text/logs")
+def text_logs(jobId: str = "", limit: int = 200) -> dict:
+    """文本处理操作日志（分级 DEBUG/INFO/WARN/ERROR，按时间倒序）"""
+    return {"logs": text_service.list_text_logs(jobId, limit)}
+
+
+@app.post("/api/text/backups")
+def text_backup_create(req: TextBackupRequest) -> dict:
+    """备份当前文本到本地文件（带时间戳，支持多份）"""
+    text = _require_text(req.text, "备份")
+    try:
+        info = text_service.backup_text(text, req.note)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"备份写入失败：{e}")
+    return info
+
+
+@app.get("/api/text/backups")
+def text_backup_list() -> dict:
+    """历史备份列表（按时间倒序）"""
+    return {"backups": text_service.list_backups()}
+
+
+@app.get("/api/text/backups/{name}")
+def text_backup_read(name: str) -> dict:
+    """读取指定备份内容，用于恢复到编辑器"""
+    try:
+        return text_service.read_backup(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="备份文件不存在")
 
 
 # ---------------------------------------------------------------------------

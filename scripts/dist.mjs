@@ -91,10 +91,14 @@ run('构建前端 (vite build)', [path.join(root, 'node_modules', 'vite', 'bin',
 // 3. 冻结后端（输出 build/pyinstaller/backend/backend.exe）
 run('冻结后端 (PyInstaller)', [path.join(root, 'scripts', 'build-backend.mjs')])
 // 4. 打包桌面应用（输出 release/）
+//    --publish never：本项目只做本地离线打包，不需要发布到 GitHub；
+//    否则在设了 CI / GH_TOKEN 的环境里，electron-builder 会尝试发布 draft release 并以非零码退出。
 run('打包应用 (electron-builder)', [
   path.join(root, 'node_modules', 'electron-builder', 'cli.js'),
   '--win',
-  'nsis'
+  'nsis',
+  '--publish',
+  'never'
 ])
 
 console.log('\n[dist] 完成，安装包位于 release/ 目录')

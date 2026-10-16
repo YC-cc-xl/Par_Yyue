@@ -70,5 +70,27 @@ export const api = {
     request(`/api/compose/tasks/${id}/projects/${projectIndex}/cancel`, { method: 'POST' }),
 
   // 实时系统资源：CPU 占用 / 磁盘读写 / 是否饱和（供资源监控面板轮询）
-  getSystemResources: () => request('/api/system/resources')
+  getSystemResources: () => request('/api/system/resources'),
+
+  // ===================== 文本处理（本地离线执行，不联网）=====================
+
+  // 智能清理广告：asyncJob 为真（或文本过长）时后端转后台任务，返回 { jobId, async: true }
+  cleanText: (text, asyncJob = false) =>
+    request('/api/text/clean', { method: 'POST', body: { text, asyncJob } }),
+  // 智能格式化文本：dropChapter 为真时同时删除章节标题行
+  formatText: (text, dropChapter = false, asyncJob = false) =>
+    request('/api/text/format', { method: 'POST', body: { text, dropChapter, asyncJob } }),
+  // 按字数剪切：返回 { first, rest }，第一段用于复制到剪贴板，剩余留在编辑器
+  splitText: (text, size) => request('/api/text/split', { method: 'POST', body: { text, size } }),
+  // 查询后台文本任务：{ status, progress, message, result }
+  getTextJob: (jobId) => request(`/api/text/jobs/${encodeURIComponent(jobId)}`),
+  // 文本处理操作日志（分级 DEBUG/INFO/WARN/ERROR）
+  listTextLogs: (jobId = '', limit = 200) =>
+    request(`/api/text/logs?${jobId ? `jobId=${encodeURIComponent(jobId)}&` : ''}limit=${limit}`),
+  // 备份当前文本（本地文件，带时间戳，支持多份）
+  createBackup: (text, note = '') => request('/api/text/backups', { method: 'POST', body: { text, note } }),
+  // 历史备份列表
+  listBackups: () => request('/api/text/backups'),
+  // 读取指定备份内容，用于恢复
+  readBackup: (name) => request(`/api/text/backups/${encodeURIComponent(name)}`)
 }
